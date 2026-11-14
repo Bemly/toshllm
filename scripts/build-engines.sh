@@ -1,23 +1,25 @@
 #!/bin/zsh
-# Builds the inference engines reproducibly:
-#   1. Official llama.cpp + AMD patches  -> vendor/llama.cpp/build-static/bin
-#   2. audio.cpp speech-to-text          -> vendor/audio.cpp/build-static/bin (scripts/engines/audio.sh)
-#   3. stable-diffusion.cpp image engine -> vendor/stable-diffusion.cpp/build-static/bin (scripts/engines/image.sh)
+# Builds the inference engines from Bemly git submodules under vendor/:
+#   vendor/llama.cpp              -> build-static/bin (llama-server, …)
+#   vendor/audio.cpp              -> build-static/bin (audiocpp_*)
+#   vendor/stable-diffusion.cpp   -> build-static/bin (sd-cli, …)
+#
+# No patch series: each submodule tip already carries the AMD Metal stack
+# (ToshGEMM + FA-RDNA2) and the ToshLLM engine bits. Bump by updating the
+# submodule commit (see scripts/bump-engine-submodules.sh / bump-engines.yml).
 #
 # Usage:
 #   ./scripts/build-engines.sh                  # host architecture
 #   ARCH=x86_64 ./scripts/build-engines.sh      # cross-compile (CI on arm64 runners)
 #   ARCH=universal ./scripts/build-engines.sh   # x86_64 + arm64 fat binaries (experimental)
+#   SKIP_LLAMA=1 SKIP_AUDIO=1 SKIP_IMAGE=1 …
 set -e
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
-LLAMA_REPO="${LLAMA_REPO:-https://github.com/Bemly/llama.cpp}"
-LLAMA_COMMIT="${LLAMA_COMMIT:-d469424b236c3a01554a23b52925f00c886b42df}"   # Bemly/llama.cpp spec, the base the patches are ported to
 ARCH="${ARCH:-$(uname -m)}"
 DEPLOYMENT_TARGET="14.0"        # same floor as the app (Package.swift)
 if [ "$ARCH" = "universal" ]; then
-    # Build each slice separately (ggml has per-arch sources) and lipo them.
     for slice in x86_64 arm64; do
         ARCH="$slice" "$0"
         for dir in vendor/llama.cpp vendor/audio.cpp; do
@@ -41,9 +43,12 @@ if [ "$ARCH" = "universal" ]; then
     exit 0
 fi
 
-# The shaders are always embedded, but compiling them at launch costs tens of seconds, so a
-# precompiled default.metallib ships alongside and device.m prefers it on matching GPUs.
-# Building it needs the Metal Toolchain from full Xcode, downloaded below if missing.
+# Ensure submodules are present (CI checkout --recurse-submodules, or first local build).
+if [ ! -e vendor/llama.cpp/.git ] || [ ! -e vendor/audio.cpp/.git ] || [ ! -e vendor/stable-diffusion.cpp/.git ]; then
+    echo "initializing engine submodules…"
+    git submodule update --init --depth 1 vendor/llama.cpp vendor/audio.cpp vendor/stable-diffusion.cpp
+fi
+
 if [ -z "${DEVELOPER_DIR:-}" ] && [ -d /Applications/Xcode.app ]; then
     export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 fi
@@ -51,7 +56,6 @@ if ! xcrun metal -v >/dev/null 2>&1 || ! xcrun -f metallib >/dev/null 2>&1; then
     xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
 fi
 resolve_metal_toolchain() {
-    # Resolve the demand-mounted toolchain before each shader build.
     xcrun metal -v >/dev/null 2>&1 || return 1
     METAL_COMPILER="$(xcrun -f metal 2>/dev/null)" || return 1
     METALLIB_COMPILER="$(xcrun -f metallib 2>/dev/null)" || return 1
@@ -66,17 +70,12 @@ else
     echo "Metal compiler unavailable — embedded source only (slower first load)"
 fi
 
-# Stamped into the binaries so a log identifies the ToshLLM build, not just the
-# upstream commit (which is unchanged across releases that only touch the patch).
-TOSH_VERSION="$(tr -d '[:space:]' < "$(dirname "$0")/../VERSION")"
+TOSH_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 
-# CI runners drop DNS or reset a transfer now and then, and a release build should not lose
-# minutes of compilation to it, so every networked git operation retries with backoff.
 retry_git() {
     local attempt=1
     local max_attempts=4
     local delay
-
     while ! "$@"; do
         if [ "$attempt" -ge "$max_attempts" ]; then
             echo "ERROR: git operation failed after $max_attempts attempts: $*" >&2
@@ -89,9 +88,6 @@ retry_git() {
     done
 }
 
-# A build-static left from before a system or Command Line Tools update keeps the old SDK and
-# compiler paths in its cache, and cmake never re-detects them: the link then fails with
-# "library 'System' not found". Drop such a cache so the next configure starts clean.
 reset_stale_cmake_cache() {
     local cache="$1/CMakeCache.txt" key cached
     [ -f "$cache" ] || return 0
@@ -110,24 +106,14 @@ CMAKE_FLAGS=(
     -DBUILD_SHARED_LIBS=OFF
     -DGGML_METAL=ON
     -DGGML_METAL_EMBED_LIBRARY=ON
-    # Compile the experimental MoE cache into the bundled engine. It remains
-    # inert unless the app explicitly sets TOSH_MOE_MODE at process launch.
     -DTOSH_ENABLE_DYNAMIC_MOE=ON
     -DGGML_NATIVE=OFF
     -DCMAKE_OSX_ARCHITECTURES="$ARCH"
-    # cmake defaults it to the build host, so a macos-26 runner emits binaries dyld
-    # refuses to start on older systems
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
     -DCMAKE_CXX_FLAGS="-DTOSH_VERSION=$TOSH_VERSION"
-    # The server binds to localhost only; skip OpenSSL so static cross-builds
-    # don't pick up host-arch Homebrew libraries on CI runners.
     -DLLAMA_OPENSSL=OFF
 )
 
-# pin every ISA flag in both variants: with GGML_NATIVE=OFF ggml's defaults follow the build
-# host, an arm64 runner cross-building x86_64 does not count as cross-compiling, and a flag left
-# out keeps whatever the previous variant cached in build-static. TOSH_NO_AVX2=1 is the SSE4.2
-# baseline for pre-AVX Xeons.
 ISA_FLAGS=()
 if [ "$ARCH" = "x86_64" ]; then
     if [ -z "${TOSH_NO_AVX2:-}" ]; then
@@ -140,35 +126,16 @@ if [ "$ARCH" = "x86_64" ]; then
     CMAKE_FLAGS+=("${ISA_FLAGS[@]}")
 fi
 
-build_engine() {
-    local vendor="$1" ref="$2" fetch_ref="$3"
-    shift 3
-    local patches=("$@")
-
-    if [ ! -d "$vendor/.git" ]; then
-        retry_git git clone --filter=blob:none "$LLAMA_REPO" "$vendor"
-    fi
-    cd "$vendor"
-    # a vendor tree cloned before the switch to the fork still points at ggml-org
-    git remote set-url origin "$LLAMA_REPO"
-    retry_git git fetch origin "$fetch_ref" 2>/dev/null || retry_git git fetch origin
-    git checkout -qf "$ref"
-    git checkout -- . 2>/dev/null || true
-    # files a patch creates are untracked, so the checkout above leaves them behind
-    # and the next apply fails; build dirs are gitignored and survive this
-    git clean -qfd 2>/dev/null || true
-
-    for patch in "${patches[@]}"; do
-        git apply "$patch"
-        echo "applied ${patch#$ROOT/patches/}"
-    done
+build_llama_engine() {
+    local vendor="vendor/llama.cpp"
+    cd "$ROOT/$vendor"
+    echo "building llama @ $(git rev-parse --short HEAD) (FA/ToshGEMM from Bemly/llama.cpp)"
 
     reset_stale_cmake_cache build-static
     cmake -B build-static "${CMAKE_FLAGS[@]}"
-    cmake --build build-static --config Release -j "${JOBS:-$(sysctl -n hw.ncpu)}" -t llama-server llama-bench llama-perplexity test-backend-ops
+    cmake --build build-static --config Release -j "${JOBS:-$(sysctl -n hw.ncpu)}" \
+        -t llama-server llama-bench llama-perplexity test-backend-ops
 
-    # One library per kernel source, with the same defines the runtime would use on an Intel/AMD
-    # GPU. They cannot be linked into one metallib: the sources share helper names.
     local embed_dir="build-static/ggml/src/ggml-metal/autogenerated"
     if [ "$METAL_PRECOMPILE" = 1 ] && [ -n "$(echo $embed_dir/ggml-metal-embed-*.metal(N))" ]; then
         local kernels="build-static/bin/kernels"
@@ -183,7 +150,6 @@ build_engine() {
                     -I ggml/src -I ggml/src/ggml-metal \
                     -c "$src" -o "$kernels/$name.air" &&
                 "$METALLIB_COMPILER" "$kernels/$name.air" -o "$kernels/$name.metallib" || { ok=0; break; }
-                # the engine loads a library only if its source matches the one embedded in the binary
                 echo "$name $(shasum -a 256 "$src" | cut -d' ' -f1)" >> "$kernels/fingerprint"
             done
         else
@@ -195,7 +161,6 @@ build_engine() {
         else
             rm -rf "$kernels"
             echo "WARNING: metallib precompile failed — falling back to runtime compile"
-            # Avoid repeating a failed optional precompile.
             METAL_PRECOMPILE=0
         fi
     fi
@@ -203,32 +168,16 @@ build_engine() {
     cd "$ROOT"
 }
 
-# The image and speech engines come from the Bemly forks; their build functions live in
-# scripts/engines/ and replace the ones defined above.
 for engine_script in "$ROOT"/scripts/engines/*.sh(N); do
     source "$engine_script"
 done
 
-# Patches live in patches/<engine>/; llama is a flat, path-disjoint 0001-0007 whole-tree split
-# (other engines may still use <area>/ subfolders). The numeric prefix is the global apply order
-# across every area, so ordering stays global while each area can be regenerated on its own.
-patch_series() {
-    find "$ROOT/patches/$1" -name '*.patch' -print |
-        awk -F/ '{print $NF"\t"$0}' | sort | cut -f2-
-}
-
-# 1. Official engine (skip with SKIP_LLAMA=1 when iterating on the image engine)
 if [ -z "$SKIP_LLAMA" ]; then
-build_engine vendor/llama.cpp "$LLAMA_COMMIT" "$LLAMA_COMMIT" ${(f)"$(patch_series llama)"}
+    build_llama_engine
 fi
-
-# 2. Speech-to-text engine (audio.cpp; skip with SKIP_AUDIO=1)
 if [ -z "$SKIP_AUDIO" ]; then
     build_audio_engine
 fi
-
-
-# 3. Image engine (stable-diffusion.cpp; skip with SKIP_IMAGE=1)
 if [ -z "$SKIP_IMAGE" ]; then
     build_image_engine
 fi

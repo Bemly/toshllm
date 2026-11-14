@@ -1,0 +1,12 @@
+[submodule "vendor/llama.cpp"]
+	path = vendor/llama.cpp
+	url = https://github.com/Bemly/llama.cpp.git
+	branch = main
+[submodule "vendor/stable-diffusion.cpp"]
+	path = vendor/stable-diffusion.cpp
+	url = https://github.com/Bemly/stable-diffusion.cpp.git
+	branch = main
+[submodule "vendor/audio.cpp"]
+	path = vendor/audio.cpp
+	url = https://github.com/Bemly/audio.cpp.git
+	branch = main

@@ -1,7 +1,12 @@
 .build/
 .vscode/
 dist/
-vendor/
+# Build outputs and non-submodule vendor bits (sympy runtime, caches).
+# The three engine submodules are tracked explicitly below.
+vendor/*
+!vendor/llama.cpp
+!vendor/stable-diffusion.cpp
+!vendor/audio.cpp
 AppIcon.iconset/
 icon-1024.png
 .DS_Store
