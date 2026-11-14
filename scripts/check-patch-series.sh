@@ -3,7 +3,7 @@
 # applies and what does not. Unlike build-engines.sh it never stops at the first failure:
 # a bump is worth judging by how much of the series moved, not by which patch broke first.
 #
-#   ./scripts/check-patch-series.sh                 # against upstream HEAD
+#   ./scripts/check-patch-series.sh                 # against the fork's spec HEAD
 #   ./scripts/check-patch-series.sh <ref>           # against a specific commit
 #   ./scripts/check-patch-series.sh <ref> out.md    # also write the report as Markdown
 #
@@ -12,7 +12,7 @@ set -u
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
-REF="${1:-origin/master}"
+REF="${1:-origin/spec}"
 REPORT="${2:-}"
 
 PIN="$(grep -oE 'LLAMA_COMMIT:-[a-f0-9]+' scripts/build-engines.sh | cut -d- -f2)"
@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [ ! -d "$VENDOR/.git" ]; then
-    git clone -q --filter=blob:none https://github.com/ggml-org/llama.cpp "$TMP/clone" || exit 1
+    git clone -q --filter=blob:none "$(grep -oE 'LLAMA_REPO:-[^}]+' scripts/build-engines.sh | cut -d- -f2-)" "$TMP/clone" || exit 1
     VENDOR="$TMP/clone"
 fi
 git -C "$VENDOR" fetch -q origin "${REF#origin/}" 2>/dev/null || git -C "$VENDOR" fetch -q origin
@@ -42,7 +42,8 @@ HEAD_SHA="$(git -C "$TREE" rev-parse --short HEAD)"
 typeset -a rows failed_files
 ok=0; threeway=0; bad=0; rejected_hunks=0
 
-# same order as build-engines.sh: recursive, by file name across the area folders
+# same order as build-engines.sh: by numeric file name. The llama series is now a flat,
+# path-disjoint 0001-0007 whole-tree split; the recursive find also covers the old area folders.
 for patch in ${(f)"$(find "$ROOT/patches/llama" -name '*.patch' | awk -F/ '{print $NF"\t"$0}' | sort | cut -f2-)"}; do
     name="${patch#$ROOT/patches/llama/}"
     if git -C "$TREE" apply "$patch" 2>/dev/null; then

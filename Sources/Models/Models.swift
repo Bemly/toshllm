@@ -363,13 +363,7 @@ final class ModelStore: ObservableObject {
 
     /// Start the scan at launch without blocking the first frame.
     init() {
-        // Keep Base selected for existing installs.
-        if UserDefaults.standard.object(forKey: SettingsKeys.whisperModel) == nil {
-            let legacy = whisperDirectory.appendingPathComponent("ggml-base.bin")
-            if FileManager.default.fileExists(atPath: legacy.path) {
-                UserDefaults.standard.set("base", forKey: SettingsKeys.whisperModel)
-            }
-        }
+        SpeechPreferences.migrateLegacyDefaults()
         refresh()
     }
 
@@ -394,18 +388,19 @@ final class ModelStore: ObservableObject {
     /// Preferred destination for image and video components and generated media.
     var imagenDirectory: URL { directory.appendingPathComponent("imagen", isDirectory: true) }
 
-    var whisperDirectory: URL { directory.appendingPathComponent("whisper", isDirectory: true) }
+    /// Speech-to-text checkpoints for the audio.cpp engine.
+    var speechDirectory: URL { directory.appendingPathComponent("speech", isDirectory: true) }
 
-    var selectedWhisperModel: WhisperModel {
-        let id = UserDefaults.standard.string(forKey: SettingsKeys.whisperModel)
-            ?? WhisperModel.recommendedID
-        return WhisperModel.model(id: id)
+    var selectedSpeechModel: SpeechModel {
+        let id = UserDefaults.standard.string(forKey: SettingsKeys.speechModel)
+            ?? SpeechModel.recommendedID
+        return SpeechModel.model(id: id)
     }
 
-    func downloadWhisperModel(_ model: WhisperModel? = nil) {
-        let model = model ?? selectedWhisperModel
+    func downloadSpeechModel(_ model: SpeechModel? = nil) {
+        let model = model ?? selectedSpeechModel
         guard let remote = URL(string: model.downloadURL) else { return }
-        let dir = whisperDirectory
+        let dir = speechDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let destination = model.url(in: dir)
         guard !FileManager.default.fileExists(atPath: destination.path),
@@ -415,50 +410,58 @@ final class ModelStore: ObservableObject {
         downloads.append(item)
     }
 
-    func whisperDownload(_ model: WhisperModel? = nil) -> DownloadItem? {
-        let destination = (model ?? selectedWhisperModel).url(in: whisperDirectory)
+    func speechDownload(_ model: SpeechModel? = nil) -> DownloadItem? {
+        let destination = (model ?? selectedSpeechModel).url(in: speechDirectory)
         return downloads.last { $0.destination == destination && !$0.finished }
     }
 
-    func whisperModelInstalled(_ model: WhisperModel? = nil) -> Bool {
-        FileManager.default.fileExists(atPath: (model ?? selectedWhisperModel).url(in: whisperDirectory).path)
+    func speechModelInstalled(_ model: SpeechModel? = nil) -> Bool {
+        FileManager.default.fileExists(atPath: (model ?? selectedSpeechModel).url(in: speechDirectory).path)
     }
 
-    var selectedWhisperModelURL: URL {
-        selectedWhisperModel.url(in: whisperDirectory)
+    var selectedSpeechModelURL: URL {
+        selectedSpeechModel.url(in: speechDirectory)
     }
 
-    func retryWhisperDownload(_ item: DownloadItem) {
-        let model = WhisperModel.catalog.first { $0.url(in: whisperDirectory) == item.destination }
+    func retrySpeechDownload(_ item: DownloadItem) {
+        let model = SpeechModel.catalog.first { $0.url(in: speechDirectory) == item.destination }
         downloads.removeAll { $0.id == item.id }
-        downloadWhisperModel(model)
+        downloadSpeechModel(model)
     }
 
-    var whisperVADURL: URL {
-        WhisperVADModel.url(in: whisperDirectory)
+    /// The optional aligner a family needs to time words (Qwen3-ASR), installed next to
+    /// the model file it belongs to.
+    func speechAlignerURL(_ model: SpeechModel? = nil) -> URL? {
+        (model ?? selectedSpeechModel).aligner?.url(in: speechDirectory)
     }
 
-    var whisperVADInstalled: Bool {
-        FileManager.default.fileExists(atPath: whisperVADURL.path)
+    func speechAlignerInstalled(_ model: SpeechModel? = nil) -> Bool {
+        guard let url = speechAlignerURL(model) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
     }
 
-    func downloadWhisperVAD() {
-        guard let remote = URL(string: WhisperVADModel.downloadURL) else { return }
-        try? FileManager.default.createDirectory(at: whisperDirectory, withIntermediateDirectories: true)
-        guard !whisperVADInstalled,
-              !downloads.contains(where: { $0.destination == whisperVADURL && $0.error == nil }) else { return }
-        let item = DownloadItem(remote: remote, destination: whisperVADURL)
+    func downloadSpeechAligner(_ model: SpeechModel? = nil) {
+        guard let aligner = (model ?? selectedSpeechModel).aligner,
+              let remote = URL(string: aligner.downloadURL) else { return }
+        let dir = speechDirectory
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let destination = aligner.url(in: dir)
+        guard !FileManager.default.fileExists(atPath: destination.path),
+              !downloads.contains(where: { $0.destination == destination && $0.error == nil }) else { return }
+        let item = DownloadItem(remote: remote, destination: destination)
         item.onFinish = { [weak self] in self?.objectWillChange.send() }
         downloads.append(item)
     }
 
-    func whisperVADDownload() -> DownloadItem? {
-        downloads.last { $0.destination == whisperVADURL && !$0.finished }
+    func speechAlignerDownload(_ model: SpeechModel? = nil) -> DownloadItem? {
+        guard let url = speechAlignerURL(model) else { return nil }
+        return downloads.last { $0.destination == url && !$0.finished }
     }
 
-    func retryWhisperVADDownload(_ item: DownloadItem) {
+    func retrySpeechAlignerDownload(_ item: DownloadItem) {
+        let model = SpeechModel.catalog.first { $0.aligner?.url(in: speechDirectory) == item.destination }
         downloads.removeAll { $0.id == item.id }
-        downloadWhisperVAD()
+        downloadSpeechAligner(model)
     }
 
     /// Download an image-gen component into the `imagen/` subfolder under its fixed

@@ -7,6 +7,7 @@ import Foundation
 struct PendingSpeechTranscription: Identifiable {
     let id: UUID
     let fileURL: URL
+    let model: SpeechModel
     let modelURL: URL
     let attachmentID: UUID
     let name: String

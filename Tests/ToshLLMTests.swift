@@ -8,56 +8,172 @@ import PDFKit
 import XCTest
 @testable import ToshLLM
 
-final class WhisperTranscriptTests: XCTestCase {
-    func testWhisperRuntimeForcesAMDFlashAttentionAndSafeMetalPolicy() {
-        let environment = SpeechDictationController.runtimeEnvironment(base: [:])
-        XCTAssertEqual(environment["TOSH_FA_AMD"], "1")
+final class SpeechTranscriptTests: XCTestCase {
+    func testSpeechRuntimeKeepsSafeMetalPolicy() {
+        let environment = SpeechEngine.runtimeEnvironment(base: [:])
         XCTAssertEqual(environment["GGML_METAL_CONCURRENCY_DISABLE"], "1")
         XCTAssertEqual(environment["GGML_METAL_SHARED_BUFFERS_DISABLE"], "1")
     }
 
-    func testWhisperCatalogDefaultsToTurboAndHasUniqueFiles() {
-        XCTAssertEqual(WhisperModel.model(id: WhisperModel.recommendedID).id,
-                       "large-v3-turbo")
-        XCTAssertEqual(Set(WhisperModel.catalog.map(\.fileName)).count,
-                       WhisperModel.catalog.count)
-        XCTAssertTrue(WhisperModel.catalog.allSatisfy {
-            $0.downloadURL.hasSuffix("/\($0.fileName)")
+    func testSpeechCatalogDefaultsToQwen3AndHasUniqueFiles() {
+        XCTAssertEqual(SpeechModel.model(id: SpeechModel.recommendedID).family, .qwen3)
+        XCTAssertEqual(SpeechModel.model(id: SpeechModel.recommendedID).id, "qwen3-asr-1.7b")
+        XCTAssertEqual(SpeechModel.model(id: "unknown").id, SpeechModel.recommendedID)
+        XCTAssertEqual(Set(SpeechModel.catalog.map(\.fileName)).count,
+                       SpeechModel.catalog.count)
+        XCTAssertTrue(SpeechModel.catalog.allSatisfy {
+            $0.downloadURL.hasPrefix("https://huggingface.co/\($0.repository)/resolve/")
+                && $0.downloadURL.hasSuffix("/\($0.remotePath)")
+                && $0.fileName.hasSuffix(".gguf")
+        })
+        // Both Qwen3-ASR checkpoints share one aligner checkpoint.
+        XCTAssertEqual(Set(SpeechModel.catalog.compactMap { $0.aligner?.fileName }).count, 1)
+        XCTAssertTrue(SpeechModel.catalog.allSatisfy {
+            $0.aligner.map { $0.fileName.hasSuffix(".gguf") } ?? true
         })
     }
 
-    func testNormalizesWhisperTextOutput() {
-        XCTAssertEqual(WhisperTranscript.normalized("  Hola mundo.\n"), "Hola mundo.")
+    func testLanguageOptionFollowsEachFamily() {
+        let sense = SpeechModel.model(id: "sensevoice-small")
+        let parakeet = SpeechModel.model(id: "parakeet-tdt-0.6b-v3")
+        let qwen = SpeechModel.model(id: "qwen3-asr-1.7b")
+        let crisper = SpeechModel.model(id: "crisperwhisper-2-large")
+        XCTAssertEqual(sense.requestLanguage(for: "es"), "es")
+        XCTAssertEqual(qwen.requestLanguage(for: "es"), "Spanish")
+        XCTAssertEqual(crisper.requestLanguage(for: "es"), "es")
+        XCTAssertNil(parakeet.requestLanguage(for: "es"))
+        XCTAssertNil(qwen.requestLanguage(for: "auto"))
+        XCTAssertTrue(parakeet.supports(language: "de"))
+        XCTAssertFalse(parakeet.supports(language: "zh"))
+        XCTAssertTrue(qwen.supports(language: "zh"))
+        XCTAssertTrue(parakeet.supports(language: "auto"))
+        // CrisperWhisper takes an explicit language and defaults to English without one.
+        XCTAssertFalse(crisper.supports(language: "auto"))
+        XCTAssertTrue(crisper.supports(language: "zh"))
+        XCTAssertEqual(crisper.effectiveLanguage("auto"), "en")
+        XCTAssertEqual(crisper.dictationLanguage("zh"), "zh")
+        // A model that detects the language keeps dictation on automatic.
+        XCTAssertEqual(qwen.dictationLanguage("zh"), "auto")
+    }
+
+    func testNormalizesTranscriptText() {
+        XCTAssertEqual(SpeechTranscript.normalized("  Hola mundo.\n"), "Hola mundo.")
     }
 
     func testMicrophoneTranscriptCollapsesInternalLineBreaks() {
         XCTAssertEqual(
-            WhisperTranscript.normalized(" Primera línea\n segunda\t línea  "),
+            SpeechTranscript.normalized(" Primera línea\n segunda\t línea  "),
             "Primera línea segunda línea"
         )
     }
 
-    func testBlankAudioMarkerProducesNoTranscript() {
-        XCTAssertEqual(WhisperTranscript.normalized(" [BLANK_AUDIO]\n"), "")
+    func testBlankTranscriptProducesNoText() {
+        XCTAssertEqual(SpeechTranscript.normalized(" \n\t"), "")
     }
 
-    func testTimestampedJSONBecomesChatReadyText() throws {
-        let json = #"{"transcription":[{"timestamps":{"from":"00:01:02,500"},"text":" Hola mundo. "}]}"#
-        XCTAssertEqual(WhisperTranscript.timestamped(jsonData: Data(json.utf8)),
-                       "[00:01:02] Hola mundo.")
+    func testWordTimestampsBecomeChatReadyText() {
+        let json = #"[{"start_sample":1000000,"end_sample":1008000,"word":"Hola","confidence":1},{"start_sample":1008000,"end_sample":1016000,"word":"mundo.","confidence":1}]"#
+        let words = SpeechTranscript.words(jsonData: Data(json.utf8))
+        XCTAssertEqual(words.count, 2)
+        XCTAssertEqual(words[0].start, 62.5, accuracy: 0.001)
+        let cues = SpeechTranscript.cues(text: "Hola mundo.", words: words, span: 0...70)
+        XCTAssertEqual(SpeechTranscript.timestamped(cues), "[00:01:02] Hola mundo.")
     }
 
-    func testPersistentServerJSONBecomesChatReadyText() {
-        let json = #"{"segments":[{"start":62.5,"end":65.0,"text":" Hola desde la GPU. "}]}"#
-        XCTAssertEqual(WhisperTranscript.timestamped(jsonData: Data(json.utf8)),
-                       "[00:01:02] Hola desde la GPU.")
+    func testPersistentServerDetailsBecomeTextAndWords() throws {
+        let json = #"{"text":"Hola desde la GPU.","words":[{"word":"Hola","start_sample":2000,"end_sample":4000,"confidence":0.9}],"sample_rate":8000,"timing":{"wall_ms":1}}"#
+        let details = try XCTUnwrap(SpeechTranscript.details(jsonData: Data(json.utf8)))
+        XCTAssertEqual(details.text, "Hola desde la GPU.")
+        XCTAssertEqual(details.words.first?.start ?? -1, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(details.words.first?.end ?? -1, 0.5, accuracy: 0.0001)
+    }
+
+    func testWordsSplitIntoCuesAtPausesAndShiftBySpan() {
+        let json = #"[{"start_sample":0,"end_sample":8000,"word":"Uno"},{"start_sample":8000,"end_sample":16000,"word":"dos."},{"start_sample":48000,"end_sample":56000,"word":"Tres"}]"#
+        let words = SpeechTranscript.words(jsonData: Data(json.utf8), offset: 10)
+        let cues = SpeechTranscript.numbered(SpeechTranscript.cues(text: "", words: words, span: 10...14))
+        XCTAssertEqual(cues.map(\.text), ["Uno dos.", "Tres"])
+        XCTAssertEqual(cues.map(\.id), [1, 2])
+        XCTAssertEqual(cues[0].start, 10, accuracy: 0.001)
+        XCTAssertEqual(cues[1].start, 13, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(cues[1].end, 14)
+    }
+
+    func testLongWordRunsStayWithinCueLimits() {
+        let words = (0..<60).map { SpeechWord(start: Double($0) * 0.3, end: Double($0) * 0.3 + 0.25, text: "palabra") }
+        let cues = SpeechTranscript.cues(text: "", words: words, span: 0...20)
+        XCTAssertGreaterThan(cues.count, 1)
+        XCTAssertTrue(cues.allSatisfy {
+            $0.text.count <= SpeechTranscript.maxCueCharacters
+                && $0.end - $0.start <= SpeechTranscript.maxCueSeconds + 0.5
+        })
+    }
+
+    func testJoinKeepsCJKTogetherAndPunctuationAttached() {
+        XCTAssertEqual(SpeechTranscript.join(["我", "想", "问", "。"]), "我想问。")
+        XCTAssertEqual(SpeechTranscript.join(["Hola", ",", "mundo"]), "Hola, mundo")
+        XCTAssertEqual(SpeechTranscript.join(["Hello", " world "]), "Hello world")
+    }
+
+    func testTextWithoutWordTimesIsSpreadAcrossTheSpan() {
+        let cues = SpeechTranscript.cues(
+            text: "Primera frase bastante larga para un subtítulo. Segunda frase también larga para otro.",
+            words: [], span: 4...12)
+        XCTAssertEqual(cues.count, 2)
+        XCTAssertEqual(cues.first?.start ?? -1, 4, accuracy: 0.001)
+        XCTAssertEqual(cues.last?.end ?? -1, 12, accuracy: 0.001)
+        XCTAssertEqual(cues[0].end, cues[1].start, accuracy: 0.001)
+    }
+
+    func testVADSegmentsAndFixedWindows() {
+        let json = #"[{"start_sample":16000,"end_sample":48000,"confidence":0.9},{"start_sample":5,"end_sample":5}]"#
+        let spans = SpeechTranscript.speechSpans(jsonData: Data(json.utf8))
+        XCTAssertEqual(spans.count, 1)
+        XCTAssertEqual(spans[0].lowerBound, 1, accuracy: 0.001)
+        XCTAssertEqual(spans[0].upperBound, 3, accuracy: 0.001)
+        let windows = SpeechTranscript.fixedWindows(duration: 65, window: 30)
+        XCTAssertEqual(windows.map(\.lowerBound), [0, 30, 60])
+        XCTAssertEqual(windows.last?.upperBound, 65)
+    }
+
+    func testPCMWaveSlicesWholeFrames() throws {
+        var pcm = Data()
+        for sample in 0..<16_000 { withUnsafeBytes(of: Int16(sample % 100).littleEndian) { pcm.append(contentsOf: $0) } }
+        let file = PCM16Wave.wavFile(pcm: pcm, sampleRate: 16_000, channels: 1)
+        let wave = try XCTUnwrap(PCM16Wave(data: file))
+        XCTAssertEqual(wave.duration, 1, accuracy: 0.0001)
+        let slice = try XCTUnwrap(PCM16Wave(data: wave.wavFile(from: 0.25, to: 0.5)))
+        XCTAssertEqual(slice.frameCount, 4_000)
+        XCTAssertEqual(slice.samples.prefix(2), pcm.subdata(in: 8_000..<8_002))
+        XCTAssertEqual(PCM16Wave(data: wave.wavFile(from: 0.9, to: 5))?.frameCount, 1_600)
     }
 
     func testSpeechPreferencesHaveStablePersistedValues() {
         XCTAssertEqual(SpeechInputMethod.apple.rawValue, "apple")
-        XCTAssertEqual(SpeechInputMethod.whisper.rawValue, "whisper")
-        XCTAssertEqual(WhisperLoadPolicy.onDemand.rawValue, "onDemand")
-        XCTAssertEqual(WhisperLoadPolicy.alwaysLoaded.rawValue, "alwaysLoaded")
+        XCTAssertEqual(SpeechInputMethod.audioCpp.rawValue, "audioCpp")
+        XCTAssertEqual(SpeechLoadPolicy.onDemand.rawValue, "onDemand")
+        XCTAssertEqual(SpeechLoadPolicy.alwaysLoaded.rawValue, "alwaysLoaded")
+    }
+
+    func testLegacySpeechDefaultsMigrate() {
+        guard let defaults = UserDefaults(suiteName: "SpeechMigrationTests") else {
+            return XCTFail("Unable to create isolated defaults")
+        }
+        defaults.removePersistentDomain(forName: "SpeechMigrationTests")
+        defer { defaults.removePersistentDomain(forName: "SpeechMigrationTests") }
+        defaults.set("whisper", forKey: SettingsKeys.speechInputMethod)
+        defaults.set("alwaysLoaded", forKey: "whisperLoadPolicy")
+        defaults.set("large-v3-turbo", forKey: "whisperModel")
+        defaults.set("translateEnglish", forKey: SettingsKeys.audioOperation)
+
+        SpeechPreferences.migrateLegacyDefaults(defaults)
+
+        XCTAssertEqual(defaults.string(forKey: SettingsKeys.speechInputMethod), "audioCpp")
+        XCTAssertEqual(defaults.string(forKey: SettingsKeys.speechLoadPolicy), "alwaysLoaded")
+        XCTAssertNil(defaults.object(forKey: "whisperModel"))
+        XCTAssertNil(defaults.object(forKey: "whisperLoadPolicy"))
+        XCTAssertEqual(defaults.string(forKey: SettingsKeys.audioOperation), "translateLocal")
+        XCTAssertEqual(defaults.string(forKey: SettingsKeys.audioTargetLanguage), "English")
     }
 
     func testSubtitleRoundTripPreservesTimingAndSingleLineText() {
@@ -73,76 +189,142 @@ final class WhisperTranscriptTests: XCTestCase {
 
     func testAudioStudioPreferencesHaveStableValues() {
         XCTAssertEqual(AudioStudioOperation.transcribe.rawValue, "transcribe")
-        XCTAssertEqual(AudioStudioOperation.translateEnglish.rawValue, "translateEnglish")
         XCTAssertEqual(AudioStudioOperation.translateLocal.rawValue, "translateLocal")
         XCTAssertEqual(AudioExportFormat.srt.fileExtension, "srt")
         XCTAssertEqual(AudioExportFormat.text.fileExtension, "txt")
     }
 
-    func testAudioStudioRunsWhisperThroughCalibratedSileroVAD() {
-        let arguments = AudioStudioController.whisperArguments(
-            audioURL: URL(fileURLWithPath: "/tmp/source.wav"),
-            modelURL: URL(fileURLWithPath: "/tmp/whisper.bin"),
-            vadModelURL: URL(fileURLWithPath: "/tmp/silero.bin"),
-            vadConfiguration: AudioVADConfiguration(
-                mode: .calibrated, calibration: AudioVADProfile.strict.calibration
-            ),
-            outputBase: URL(fileURLWithPath: "/tmp/result"),
-            gpuIndex: 2, language: "es"
+    func testAudioStudioTranscribesSegmentsInOneBatchOnTheSelectedGPU() {
+        let model = SpeechModel.model(id: "sensevoice-small")
+        let arguments = SpeechEngine.asrArguments(
+            model: model, modelURL: URL(fileURLWithPath: "/tmp/sense.gguf"),
+            vadModel: URL(fileURLWithPath: "/tmp/silero_vad"),
+            gpuIndex: 2, language: "es", input: .directory(URL(fileURLWithPath: "/tmp/segments")),
+            textOut: URL(fileURLWithPath: "/tmp/out/text.txt"),
+            wordsOut: URL(fileURLWithPath: "/tmp/out/words.json")
         )
-        XCTAssertTrue(arguments.contains("--vad"))
-        guard let vad = arguments.firstIndex(of: "--vad-model"),
-              let threshold = arguments.firstIndex(of: "--vad-threshold"),
-              let minSpeech = arguments.firstIndex(of: "--vad-min-speech-duration-ms"),
-              let minSilence = arguments.firstIndex(of: "--vad-min-silence-duration-ms"),
-              let maxSpeech = arguments.firstIndex(of: "--vad-max-speech-duration-s"),
-              let speechPad = arguments.firstIndex(of: "--vad-speech-pad-ms"),
-              let overlap = arguments.firstIndex(of: "--vad-samples-overlap"),
-              let gpu = arguments.firstIndex(of: "-dev"),
-              let language = arguments.firstIndex(of: "-l") else {
-            return XCTFail("Missing Audio transcription arguments")
+        func value(after flag: String) -> String? {
+            arguments.firstIndex(of: flag).map { arguments[$0 + 1] }
         }
-        XCTAssertEqual(arguments[vad + 1], "/tmp/silero.bin")
-        XCTAssertEqual(arguments[threshold + 1], "0.75")
-        XCTAssertEqual(arguments[minSpeech + 1], "500")
-        XCTAssertEqual(arguments[minSilence + 1], "250")
-        XCTAssertEqual(arguments[maxSpeech + 1], "25.0")
-        XCTAssertEqual(arguments[speechPad + 1], "60")
-        XCTAssertEqual(arguments[overlap + 1], "0.05")
-        XCTAssertEqual(arguments[gpu + 1], "2")
-        XCTAssertEqual(arguments[language + 1], "es")
-        XCTAssertFalse(arguments.contains("--diarize"))
-        XCTAssertFalse(arguments.contains("--tinydiarize"))
+        XCTAssertEqual(value(after: "--task"), "asr")
+        XCTAssertEqual(value(after: "--family"), "sense_asr")
+        XCTAssertEqual(value(after: "--backend"), "metal")
+        XCTAssertEqual(value(after: "--device"), "2")
+        XCTAssertEqual(value(after: "--batch-audio-dir"), "/tmp/segments")
+        XCTAssertEqual(value(after: "--words-out"), "/tmp/out/words.json")
+        XCTAssertEqual(value(after: "--request-option"), "language=es")
+        XCTAssertEqual(value(after: "--session-option"), "sense_asr.vad_model_path=/tmp/silero_vad")
+        XCTAssertNil(value(after: "--audio"))
+    }
+
+    func testQwenTimesWordsOnlyWhenTheAlignerIsInstalled() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ToshLLM-aligner-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let model = SpeechModel.model(id: "qwen3-asr-0.6b")
+        let aligner = try XCTUnwrap(model.aligner)
+        let modelURL = dir.appendingPathComponent(model.fileName)
+        try Data().write(to: modelURL)
+
+        func arguments() -> [String] {
+            SpeechEngine.asrArguments(
+                model: model, modelURL: modelURL,
+                vadModel: URL(fileURLWithPath: "/tmp/silero_vad"), gpuIndex: -1, language: "ja",
+                input: .file(URL(fileURLWithPath: "/tmp/a.wav")),
+                textOut: URL(fileURLWithPath: "/tmp/t.txt"), wordsOut: URL(fileURLWithPath: "/tmp/w.json")
+            )
+        }
+
+        XCTAssertFalse(model.providesWordTimings(beside: modelURL))
+        let untimed = arguments()
+        XCTAssertFalse(untimed.contains("--words-out"))
+        XCTAssertTrue(untimed.contains("language=Japanese"))
+        XCTAssertEqual(untimed[untimed.firstIndex(of: "--device")! + 1], "0")
+        XCTAssertEqual(untimed[untimed.firstIndex(of: "--audio")! + 1], "/tmp/a.wav")
+
+        // The aligner sits next to the model file and turns word timings on.
+        try Data().write(to: aligner.url(in: dir))
+        XCTAssertTrue(model.providesWordTimings(beside: modelURL))
+        let timed = arguments()
+        XCTAssertEqual(timed[timed.firstIndex(of: "--words-out")! + 1], "/tmp/w.json")
+        let options = timed.indices.filter { timed[$0] == "--session-option" }.map { timed[$0 + 1] }
+        XCTAssertEqual(options, [
+            "qwen3_asr.forced_aligner_path=\(aligner.url(in: dir).path)",
+            "qwen3_asr.vad_model_path=/tmp/silero_vad"
+        ])
+    }
+
+    func testParakeetUsesLongFormWindowsAndTakesNoLanguage() {
+        let parakeet = SpeechEngine.asrArguments(
+            model: SpeechModel.model(id: "parakeet-tdt-0.6b-v3"), modelURL: URL(fileURLWithPath: "/tmp/p.gguf"),
+            vadModel: URL(fileURLWithPath: "/tmp/silero_vad"), gpuIndex: 0, language: "es",
+            input: .file(URL(fileURLWithPath: "/tmp/a.wav")),
+            textOut: URL(fileURLWithPath: "/tmp/t.txt"), wordsOut: nil
+        )
+        XCTAssertFalse(parakeet.contains("--request-option"))
+        XCTAssertFalse(parakeet.contains("--words-out"))
+        XCTAssertTrue(parakeet.contains("parakeet_tdt.offline_mode=auto"))
+    }
+
+    func testAudioStudioRunsSileroVADWithCalibration() {
+        let arguments = SpeechEngine.vadArguments(
+            audioURL: URL(fileURLWithPath: "/tmp/source.wav"),
+            vadModel: URL(fileURLWithPath: "/tmp/silero_vad"),
+            segmentsOut: URL(fileURLWithPath: "/tmp/segments.json"),
+            configuration: AudioVADConfiguration(
+                mode: .calibrated, calibration: AudioVADProfile.strict.calibration
+            )
+        )
+        XCTAssertEqual(arguments[arguments.firstIndex(of: "--family")! + 1], "silero_vad")
+        XCTAssertEqual(arguments[arguments.firstIndex(of: "--backend")! + 1], "cpu")
+        XCTAssertEqual(arguments[arguments.firstIndex(of: "--model")! + 1], "/tmp/silero_vad")
+        XCTAssertEqual(arguments[arguments.firstIndex(of: "--segments-out")! + 1], "/tmp/segments.json")
+        let options = arguments.indices.filter { arguments[$0] == "--request-option" }.map { arguments[$0 + 1] }
+        XCTAssertEqual(options, [
+            "threshold=0.75", "min_speech_duration_ms=500", "min_silence_duration_ms=250",
+            "max_speech_duration_sec=25.0", "speech_pad_ms=60"
+        ])
     }
 
     func testAudioStudioCanUseNativeVADDefaultsWithoutCalibration() {
-        let arguments = AudioStudioController.whisperArguments(
-            audioURL: URL(fileURLWithPath: "/tmp/source.wav"),
-            modelURL: URL(fileURLWithPath: "/tmp/whisper.bin"),
-            vadModelURL: URL(fileURLWithPath: "/tmp/silero.bin"),
-            vadConfiguration: AudioVADConfiguration(mode: .standard, calibration: nil),
-            outputBase: URL(fileURLWithPath: "/tmp/result"),
-            gpuIndex: 0, language: "auto"
-        )
-        XCTAssertTrue(arguments.contains("--vad"))
-        XCTAssertTrue(arguments.contains("--vad-model"))
-        XCTAssertFalse(arguments.contains("--vad-threshold"))
-        XCTAssertFalse(arguments.contains("--vad-min-speech-duration-ms"))
-        XCTAssertFalse(arguments.contains("--vad-samples-overlap"))
+        let configuration = AudioVADConfiguration(mode: .standard, calibration: nil)
+        XCTAssertEqual(configuration.requestOptions.map { "\($0.0)=\($0.1)" },
+                       ["max_speech_duration_sec=30.0"])
     }
 
     func testAudioStudioCanDisableVAD() {
-        let arguments = AudioStudioController.whisperArguments(
-            audioURL: URL(fileURLWithPath: "/tmp/source.wav"),
-            modelURL: URL(fileURLWithPath: "/tmp/whisper.bin"),
-            vadModelURL: URL(fileURLWithPath: "/tmp/silero.bin"),
-            vadConfiguration: AudioVADConfiguration(mode: .disabled, calibration: nil),
-            outputBase: URL(fileURLWithPath: "/tmp/result"),
-            gpuIndex: 0, language: "auto"
-        )
-        XCTAssertFalse(arguments.contains("--vad"))
-        XCTAssertFalse(arguments.contains("--vad-model"))
-        XCTAssertFalse(arguments.contains("--vad-threshold"))
+        let configuration = AudioVADConfiguration(mode: .disabled, calibration: nil)
+        XCTAssertFalse(configuration.isEnabled)
+        XCTAssertTrue(configuration.requestOptions.isEmpty)
+    }
+
+    func testPersistentServerConfigKeepsOneModelLoadedOnMetal() throws {
+        let data = try SpeechEngine.serverConfiguration(
+            model: SpeechModel.model(id: "parakeet-tdt-0.6b-v3"),
+            modelURL: URL(fileURLWithPath: "/tmp/p.gguf"),
+            vadModel: URL(fileURLWithPath: "/tmp/silero_vad"), gpuIndex: 1, port: 18_091)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(root["backend"] as? String, "metal")
+        XCTAssertEqual(root["device"] as? Int, 1)
+        XCTAssertEqual(root["host"] as? String, "127.0.0.1")
+        XCTAssertEqual(root["lazy_load"] as? Bool, false)
+        let model = try XCTUnwrap((root["models"] as? [[String: Any]])?.first)
+        XCTAssertEqual(model["id"] as? String, SpeechEngine.serverModelID)
+        XCTAssertEqual(model["family"] as? String, "parakeet_tdt")
+        XCTAssertEqual(model["task"] as? String, "asr")
+        XCTAssertEqual(model["path"] as? String, "/tmp/p.gguf")
+
+        let request = try SpeechEngine.serverRequest(
+            model: SpeechModel.model(id: "sensevoice-small"),
+            modelURL: URL(fileURLWithPath: "/tmp/s.gguf"),
+            audioURL: URL(fileURLWithPath: "/tmp/a.wav"),
+            language: "ko", withTimestamps: true)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: request) as? [String: Any])
+        XCTAssertEqual(body["audio"] as? String, "/tmp/a.wav")
+        XCTAssertEqual(body["options"] as? [String: String],
+                       ["language": "ko", "return_timestamps": "true"])
     }
 
     func testCurrentSubtitleFollowsPlaybackPositionAndRespectsGaps() {
@@ -288,7 +470,7 @@ final class WhisperTranscriptTests: XCTestCase {
         XCTAssertEqual(AudioVADProfile.defaultProfile, .balanced)
     }
 
-    func testCustomVADCalibrationIsClampedBeforeLaunchingWhisper() {
+    func testCustomVADCalibrationIsClampedBeforeLaunchingSilero() {
         let calibration = AudioVADCalibration.custom(
             threshold: 2, minSpeechDurationMS: 1,
             minSilenceDurationMS: 9_000, maxSpeechDurationSeconds: 2,
@@ -327,7 +509,7 @@ final class WhisperTranscriptTests: XCTestCase {
         XCTAssertEqual(calibration.speechPadMS, 40)
     }
 
-    func testAudioVADDefaultsToNativeWhisperValues() {
+    func testAudioVADDefaultsToNativeSileroValues() {
         guard let defaults = UserDefaults(suiteName: "AudioVADDefaultTests") else {
             return XCTFail("Unable to create isolated defaults")
         }
@@ -338,10 +520,12 @@ final class WhisperTranscriptTests: XCTestCase {
         XCTAssertNil(configuration.calibration)
     }
 
-    func testWhisperVADModelMatchesUpstreamArtifact() {
-        XCTAssertEqual(WhisperVADModel.fileName, "ggml-silero-v6.2.0.bin")
-        XCTAssertEqual(WhisperVADModel.sizeKB, 864)
-        XCTAssertTrue(WhisperVADModel.downloadURL.hasSuffix("/ggml-silero-v6.2.0.bin"))
+    func testSileroVADShipsWithTheEngine() {
+        XCTAssertTrue(SpeechEngine.vadModelDirectory.path.hasSuffix("/assets/framework/models/silero_vad"))
+        XCTAssertEqual(SpeechEngine.vadModelDirectory.deletingLastPathComponent()
+                        .deletingLastPathComponent().deletingLastPathComponent()
+                        .deletingLastPathComponent().path,
+                       SpeechEngine.resourceDirectory.path)
     }
 }
 

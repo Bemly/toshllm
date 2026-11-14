@@ -24,7 +24,7 @@ jobs:
       - name: Resolve latest llama.cpp commit
         id: upstream
         run: |
-          SHA=$(git ls-remote https://github.com/ggml-org/llama.cpp HEAD | cut -c1-7)
+          SHA=$(git ls-remote https://github.com/Bemly/llama.cpp refs/heads/spec | cut -c1-7)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           CURRENT=$(grep -oE 'LLAMA_COMMIT:-[a-f0-9]+' scripts/build-engines.sh | cut -d- -f2)
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"

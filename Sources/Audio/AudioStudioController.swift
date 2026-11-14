@@ -48,13 +48,17 @@ final class AudioStudioController: ObservableObject {
 
     private var process: Process?
     private var stderrPipe: Pipe?
+    private var stdoutPipe: Pipe?
     private var stderrBuffer = ""
+    private var stdoutBuffer = ""
+    private var segmentTotal = 0
+    private var finishedSegments = 0
     private var workDirectory: URL?
-    private var outputBase: URL?
     private var runID: UUID?
     private var ticker: Task<Void, Never>?
     private var translationTask: Task<Void, Never>?
     private var timeObserver: Any?
+    private var restoreModel: SpeechModel?
     private var restoreModelURL: URL?
     private var restoreGPUIndex = 0
     private var shouldRestorePersistentModel = false
@@ -137,7 +141,7 @@ final class AudioStudioController: ObservableObject {
         ))
     }
 
-    func start(modelURL: URL, vadModelURL: URL, vadConfiguration: AudioVADConfiguration,
+    func start(model: SpeechModel, modelURL: URL, vadConfiguration: AudioVADConfiguration,
                gpuIndex: Int, language: String,
                operation: AudioStudioOperation, targetLanguage: String,
                chatPort: Int, routerModel: String?, glossary: String,
@@ -149,11 +153,11 @@ final class AudioStudioController: ObservableObject {
             fail("Termina primero el dictado del micrófono o la transcripción adjunta / finish microphone dictation or the attached transcription first.")
             return
         }
-        guard FileManager.default.isExecutableFile(atPath: SpeechDictationController.binary) else {
-            fail("No se encontró Whisper.cpp / Whisper.cpp is missing.")
+        guard SpeechEngine.installed else {
+            fail("No se encontró el motor de voz audio.cpp / the audio.cpp speech engine is missing.")
             return
         }
-        guard !vadConfiguration.isEnabled || FileManager.default.fileExists(atPath: vadModelURL.path) else {
+        guard !vadConfiguration.isEnabled || SpeechEngine.vadInstalled else {
             fail("No se encontró el detector de voz Silero / the Silero voice detector is missing.")
             return
         }
@@ -164,6 +168,7 @@ final class AudioStudioController: ObservableObject {
 
         cancel(clearResult: true)
         self.sourceURL = sourceURL
+        restoreModel = model
         restoreModelURL = modelURL
         restoreGPUIndex = max(0, gpuIndex)
         shouldRestorePersistentModel = restorePersistentModel
@@ -185,44 +190,26 @@ final class AudioStudioController: ObservableObject {
             return
         }
         workDirectory = directory
+        let job = AudioTranscriptionJob(
+            model: model, modelURL: modelURL, vadConfiguration: vadConfiguration,
+            gpuIndex: gpuIndex, language: model.effectiveLanguage(language),
+            operation: operation, targetLanguage: targetLanguage, chatPort: chatPort,
+            routerModel: routerModel, glossary: glossary
+        )
         let converted = directory.appendingPathComponent("source.wav")
-        let converter = Process()
-        converter.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
-        converter.arguments = [sourceURL.path, converted.path, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1"]
-        converter.standardOutput = FileHandle.nullDevice
-        let diagnostics = Pipe()
-        converter.standardError = diagnostics
-        converter.terminationHandler = { [weak self] completed in
-            let data = diagnostics.fileHandleForReading.readDataToEndOfFile()
-            let message = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in
-                guard let self, self.runID == id else { return }
-                self.process = nil
-                guard completed.terminationStatus == 0 else {
-                    self.fail(message.trimmingCharacters(in: .whitespacesAndNewlines))
-                    return
-                }
-                self.runWhisper(audioURL: converted, modelURL: modelURL, vadModelURL: vadModelURL,
-                                vadConfiguration: vadConfiguration, gpuIndex: gpuIndex, language: language,
-                                operation: operation, targetLanguage: targetLanguage,
-                                chatPort: chatPort, routerModel: routerModel, glossary: glossary)
+        convert(sourceURL, to: converted, runID: id) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let failure): self.fail(failure.message)
+            case .success: self.planSpans(audioURL: converted, job: job, runID: id)
             }
-        }
-        do {
-            try converter.run()
-            process = converter
-        } catch {
-            fail(error.localizedDescription)
         }
     }
 
-    func previewVAD(modelURL: URL, vadModelURL: URL,
-                    vadConfiguration: AudioVADConfiguration,
-                    gpuIndex: Int, language: String) {
+    func previewVAD(vadConfiguration: AudioVADConfiguration) {
         guard let sourceURL, !isBusy, vadConfiguration.isEnabled else { return }
-        guard FileManager.default.isExecutableFile(atPath: SpeechDictationController.binary),
-              FileManager.default.fileExists(atPath: vadModelURL.path) else {
-            vadPreviewState = .failed("Falta Whisper o Silero VAD / Whisper or Silero VAD is missing.")
+        guard SpeechEngine.installed, SpeechEngine.vadInstalled else {
+            vadPreviewState = .failed("Falta audio.cpp o Silero VAD / audio.cpp or Silero VAD is missing.")
             return
         }
         let id = UUID()
@@ -239,73 +226,46 @@ final class AudioStudioController: ObservableObject {
             return
         }
         workDirectory = directory
-        let audioURL = directory.appendingPathComponent("preview.wav")
-        let converter = Process()
-        converter.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
-        converter.arguments = [sourceURL.path, audioURL.path, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1"]
-        converter.standardOutput = FileHandle.nullDevice
-        converter.standardError = FileHandle.nullDevice
-        converter.terminationHandler = { [weak self] completed in
+        let converted = directory.appendingPathComponent("source.wav")
+        let sampleURL = directory.appendingPathComponent("preview.wav")
+        convert(sourceURL, to: converted, runID: id) { [weak self] result in
+            guard let self else { return }
+            guard case .success = result else {
+                self.finishVADPreview(.failed("No se pudo preparar la muestra / the sample could not be prepared."))
+                return
+            }
             Task { @MainActor in
-                guard let self, self.runID == id else { return }
-                guard completed.terminationStatus == 0 else {
+                let written = await Task.detached {
+                    guard let data = try? Data(contentsOf: converted, options: .alwaysMapped),
+                          let wave = PCM16Wave(data: data) else { return false }
+                    return (try? wave.wavFile(from: 0, to: Self.vadPreviewSeconds)
+                        .write(to: sampleURL, options: .atomic)) != nil
+                }.value
+                guard self.runID == id else { return }
+                guard written else {
                     self.finishVADPreview(.failed("No se pudo preparar la muestra / the sample could not be prepared."))
                     return
                 }
-                self.runVADPreview(audioURL: audioURL, modelURL: modelURL,
-                                   vadModelURL: vadModelURL, configuration: vadConfiguration,
-                                   gpuIndex: gpuIndex, language: language, runID: id)
+                self.progress = 0.5
+                self.runVAD(audioURL: sampleURL, configuration: vadConfiguration, runID: id) { result in
+                    switch result {
+                    case .failure:
+                        self.finishVADPreview(.failed("VAD no pudo analizar la muestra / VAD could not analyze the sample."))
+                    case .success(let spans):
+                        self.vadPreviewCues = spans.enumerated().map { index, span in
+                            SubtitleCue(id: index + 1, start: span.lowerBound, end: span.upperBound, text: "")
+                        }
+                        let speech = spans.reduce(0) { $0 + max(0, $1.upperBound - $1.lowerBound) }
+                        let sample = min(Self.vadPreviewSeconds, self.duration > 0 ? self.duration : Self.vadPreviewSeconds)
+                        self.finishVADPreview(.ready(segmentCount: spans.count,
+                                                     speechSeconds: speech, sampleSeconds: sample))
+                    }
+                }
             }
-        }
-        do {
-            try converter.run()
-            process = converter
-        } catch {
-            finishVADPreview(.failed(error.localizedDescription))
         }
     }
 
-    private func runVADPreview(audioURL: URL, modelURL: URL, vadModelURL: URL,
-                               configuration: AudioVADConfiguration, gpuIndex: Int,
-                               language: String, runID id: UUID) {
-        guard let workDirectory else { return }
-        let base = workDirectory.appendingPathComponent("vad-preview")
-        let preview = Process()
-        preview.executableURL = URL(fileURLWithPath: SpeechDictationController.binary)
-        var arguments = Self.whisperArguments(
-            audioURL: audioURL, modelURL: modelURL, vadModelURL: vadModelURL,
-            vadConfiguration: configuration, outputBase: base,
-            gpuIndex: gpuIndex, language: language
-        )
-        arguments.append(contentsOf: ["--duration", "30000"])
-        preview.arguments = arguments
-        preview.environment = SpeechDictationController.runtimeEnvironment(base: ProcessInfo.processInfo.environment)
-        preview.standardOutput = FileHandle.nullDevice
-        preview.standardError = FileHandle.nullDevice
-        preview.terminationHandler = { [weak self] completed in
-            Task { @MainActor in
-                guard let self, self.runID == id else { return }
-                guard completed.terminationStatus == 0 else {
-                    self.finishVADPreview(.failed("VAD no pudo analizar la muestra / VAD could not analyze the sample."))
-                    return
-                }
-                let raw = (try? String(contentsOf: base.appendingPathExtension("srt"), encoding: .utf8)) ?? ""
-                let previewCues = SubtitleCue.parseSRT(raw)
-                self.vadPreviewCues = previewCues
-                let speech = previewCues.reduce(0) { $0 + max(0, $1.end - $1.start) }
-                let sample = min(30, self.duration > 0 ? self.duration : 30)
-                self.finishVADPreview(.ready(segmentCount: previewCues.count,
-                                             speechSeconds: speech, sampleSeconds: sample))
-            }
-        }
-        do {
-            try preview.run()
-            process = preview
-            progress = 0.5
-        } catch {
-            finishVADPreview(.failed(error.localizedDescription))
-        }
-    }
+    nonisolated private static let vadPreviewSeconds = 30.0
 
     private func finishVADPreview(_ state: AudioVADPreviewState) {
         runID = nil
@@ -316,12 +276,139 @@ final class AudioStudioController: ObservableObject {
         cleanupWorkDirectory()
     }
 
+    /// Converts any audio or video track to the 16 kHz mono PCM WAV the engine reads.
+    private func convert(_ source: URL, to destination: URL, runID id: UUID,
+                         completion: @escaping @MainActor (Result<Void, AudioStudioFailure>) -> Void) {
+        let converter = Process()
+        converter.executableURL = URL(fileURLWithPath: "/usr/bin/afconvert")
+        converter.arguments = [source.path, destination.path, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1"]
+        converter.standardOutput = FileHandle.nullDevice
+        let diagnostics = Pipe()
+        converter.standardError = diagnostics
+        converter.terminationHandler = { [weak self] completed in
+            let data = diagnostics.fileHandleForReading.readDataToEndOfFile()
+            let message = String(decoding: data, as: UTF8.self)
+            Task { @MainActor in
+                guard let self, self.runID == id else { return }
+                self.process = nil
+                completion(completed.terminationStatus == 0
+                           ? .success(())
+                           : .failure(AudioStudioFailure(message.trimmingCharacters(in: .whitespacesAndNewlines))))
+            }
+        }
+        do {
+            try converter.run()
+            process = converter
+        } catch {
+            completion(.failure(AudioStudioFailure(error.localizedDescription)))
+        }
+    }
+
+    /// Runs Silero VAD over a WAV and returns its speech spans in seconds.
+    private func runVAD(audioURL: URL, configuration: AudioVADConfiguration, runID id: UUID,
+                        completion: @escaping @MainActor (Result<[ClosedRange<TimeInterval>], AudioStudioFailure>) -> Void) {
+        let segmentsURL = audioURL.deletingPathExtension().appendingPathExtension("segments.json")
+        let vad = Process()
+        vad.executableURL = URL(fileURLWithPath: SpeechEngine.cliBinary)
+        vad.currentDirectoryURL = SpeechEngine.resourceDirectory
+        vad.arguments = SpeechEngine.vadArguments(
+            audioURL: audioURL, vadModel: SpeechEngine.vadModelDirectory,
+            segmentsOut: segmentsURL, configuration: configuration
+        )
+        vad.environment = SpeechEngine.runtimeEnvironment(base: ProcessInfo.processInfo.environment)
+        vad.standardOutput = FileHandle.nullDevice
+        let diagnostics = Pipe()
+        vad.standardError = diagnostics
+        vad.terminationHandler = { [weak self] completed in
+            let data = diagnostics.fileHandleForReading.readDataToEndOfFile()
+            let details = String(decoding: data, as: UTF8.self)
+            Task { @MainActor in
+                guard let self, self.runID == id else { return }
+                self.process = nil
+                guard completed.terminationStatus == 0 else {
+                    AppLog.speech.error("audio.cpp VAD failed: \(details, privacy: .public)")
+                    completion(.failure(AudioStudioFailure(SpeechEngine.failureReason(details))))
+                    return
+                }
+                // No segments file means Silero found no speech at all.
+                let spans = (try? Data(contentsOf: segmentsURL)).map { SpeechTranscript.speechSpans(jsonData: $0) } ?? []
+                completion(.success(spans))
+            }
+        }
+        do {
+            try vad.run()
+            process = vad
+        } catch {
+            completion(.failure(AudioStudioFailure(error.localizedDescription)))
+        }
+    }
+
+    /// Speech spans from Silero VAD, or fixed windows over the whole recording without it.
+    private func planSpans(audioURL: URL, job: AudioTranscriptionJob, runID id: UUID) {
+        guard job.vadConfiguration.isEnabled else {
+            writeSegments(audioURL: audioURL, spans: nil, job: job, runID: id)
+            return
+        }
+        stage = .analyzingVAD
+        progress = 0.04
+        runVAD(audioURL: audioURL, configuration: job.vadConfiguration, runID: id) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let failure):
+                self.fail(failure.message.isEmpty
+                          ? "VAD no pudo analizar el audio / VAD could not analyze the audio."
+                          : failure.message)
+            case .success(let spans) where spans.isEmpty:
+                self.fail("No se detectó voz / no speech was detected.")
+            case .success(let spans):
+                self.writeSegments(audioURL: audioURL, spans: spans, job: job, runID: id)
+            }
+        }
+    }
+
+    private func writeSegments(audioURL: URL, spans: [ClosedRange<TimeInterval>]?,
+                               job: AudioTranscriptionJob, runID id: UUID) {
+        guard let workDirectory else { return }
+        let segments = workDirectory.appendingPathComponent("segments", isDirectory: true)
+        Task { @MainActor in
+            let planned: [ClosedRange<TimeInterval>]? = await Task.detached {
+                guard let data = try? Data(contentsOf: audioURL, options: .alwaysMapped),
+                      let wave = PCM16Wave(data: data),
+                      (try? FileManager.default.createDirectory(at: segments,
+                                                               withIntermediateDirectories: true)) != nil else {
+                    return nil
+                }
+                let spans = (spans ?? SpeechTranscript.fixedWindows(duration: wave.duration))
+                    .filter { $0.upperBound - $0.lowerBound >= 0.1 }
+                for (index, span) in spans.enumerated() {
+                    let url = segments.appendingPathComponent(Self.segmentName(index) + ".wav")
+                    guard (try? wave.wavFile(from: span.lowerBound, to: span.upperBound)
+                        .write(to: url, options: .atomic)) != nil else { return nil }
+                }
+                return spans
+            }.value
+            guard runID == id else { return }
+            guard let planned else {
+                fail("No se pudo preparar el audio / the audio could not be prepared.")
+                return
+            }
+            guard !planned.isEmpty else {
+                fail("No se detectó voz / no speech was detected.")
+                return
+            }
+            runTranscription(segments: segments, spans: planned, job: job, runID: id)
+        }
+    }
+
+    nonisolated static func segmentName(_ index: Int) -> String {
+        "seg" + String(format: "%05d", index)
+    }
+
     func cancel(clearResult: Bool = false) {
         runID = nil
         process?.terminate()
         process = nil
-        stderrPipe?.fileHandleForReading.readabilityHandler = nil
-        stderrPipe = nil
+        stopReadingPipes()
         translationTask?.cancel()
         translationTask = nil
         ticker?.cancel()
@@ -374,73 +461,68 @@ final class AudioStudioController: ObservableObject {
         duration = max(0, value.seconds)
     }
 
-    private func runWhisper(audioURL: URL, modelURL: URL, vadModelURL: URL,
-                            vadConfiguration: AudioVADConfiguration, gpuIndex: Int,
-                            language: String, operation: AudioStudioOperation,
-                            targetLanguage: String, chatPort: Int, routerModel: String?,
-                            glossary: String) {
-        guard let id = runID, let workDirectory else { return }
+    /// One model session transcribes every span (`--batch-audio-dir`), and reports each span
+    /// as it finishes, which drives the progress bar.
+    private func runTranscription(segments: URL, spans: [ClosedRange<TimeInterval>],
+                                  job: AudioTranscriptionJob, runID id: UUID) {
+        guard let workDirectory else { return }
         stage = .transcribing
         progress = 0.08
-        let base = workDirectory.appendingPathComponent("result")
-        outputBase = base
+        segmentTotal = spans.count
+        finishedSegments = 0
+        stdoutBuffer = ""
+        let output = workDirectory.appendingPathComponent("transcripts", isDirectory: true)
 
-        let whisper = Process()
-        whisper.executableURL = URL(fileURLWithPath: SpeechDictationController.binary)
-        var arguments = Self.whisperArguments(
-            audioURL: audioURL, modelURL: modelURL, vadModelURL: vadModelURL,
-            vadConfiguration: vadConfiguration, outputBase: base,
-            gpuIndex: gpuIndex, language: language
+        let asr = Process()
+        asr.executableURL = URL(fileURLWithPath: SpeechEngine.cliBinary)
+        asr.currentDirectoryURL = SpeechEngine.resourceDirectory
+        asr.arguments = SpeechEngine.asrArguments(
+            model: job.model, modelURL: job.modelURL, vadModel: SpeechEngine.vadModelDirectory,
+            gpuIndex: job.gpuIndex, language: job.language, input: .directory(segments),
+            textOut: output.appendingPathComponent("text.txt"),
+            wordsOut: output.appendingPathComponent("words.json")
         )
-        if operation == .translateEnglish { arguments.append("-tr") }
-        whisper.arguments = arguments
-        whisper.environment = SpeechDictationController.runtimeEnvironment(base: ProcessInfo.processInfo.environment)
-        whisper.standardOutput = FileHandle.nullDevice
+        asr.environment = SpeechEngine.runtimeEnvironment(base: ProcessInfo.processInfo.environment)
+        let results = Pipe()
+        stdoutPipe = results
+        asr.standardOutput = results
+        results.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let chunk = String(decoding: data, as: UTF8.self)
+            Task { @MainActor in self?.consumeOutput(chunk, runID: id) }
+        }
         let diagnostics = Pipe()
         stderrPipe = diagnostics
-        whisper.standardError = diagnostics
+        asr.standardError = diagnostics
         diagnostics.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let chunk = String(decoding: data, as: UTF8.self)
             Task { @MainActor in self?.consumeDiagnostics(chunk, runID: id) }
         }
-        whisper.terminationHandler = { [weak self] completed in
+        asr.terminationHandler = { [weak self] completed in
             Task { @MainActor in
                 guard let self, self.runID == id else { return }
-                self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
-                self.stderrPipe = nil
+                self.stopReadingPipes()
                 self.process = nil
                 guard completed.terminationStatus == 0 else {
-                    self.fail(self.stderrBuffer.split(whereSeparator: \.isNewline).last.map(String.init) ?? "Whisper.cpp no pudo completar la transcripción / could not complete the transcription.")
+                    AppLog.speech.error("audio.cpp failed: \(self.stderrBuffer, privacy: .public)")
+                    let reason = SpeechEngine.failureReason(self.stderrBuffer)
+                    self.fail(reason.isEmpty
+                              ? "audio.cpp no pudo completar la transcripción / audio.cpp could not complete the transcription."
+                              : reason)
                     return
                 }
-                self.loadWhisperResult(operation: operation, targetLanguage: targetLanguage,
-                                       chatPort: chatPort, routerModel: routerModel, glossary: glossary)
+                self.loadTranscription(output: output, spans: spans, job: job)
             }
         }
         do {
-            try whisper.run()
-            process = whisper
+            try asr.run()
+            process = asr
         } catch {
             fail(error.localizedDescription)
         }
-    }
-
-    nonisolated static func whisperArguments(audioURL: URL, modelURL: URL, vadModelURL: URL,
-                                             vadConfiguration: AudioVADConfiguration,
-                                             outputBase: URL, gpuIndex: Int,
-                                             language: String) -> [String] {
-        var arguments = [
-            "-m", modelURL.path, "-f", audioURL.path,
-            "-l", language, "-dev", String(max(0, gpuIndex)),
-            "-t", String(max(1, min(8, ProcessInfo.processInfo.activeProcessorCount)))
-        ]
-        arguments.append(contentsOf: vadConfiguration.arguments(modelURL: vadModelURL))
-        arguments.append(contentsOf: [
-            "-of", outputBase.path, "-osrt", "-oj", "-pp", "-sow"
-        ])
-        return arguments
     }
 
     nonisolated static func cueID(at time: TimeInterval, in cues: [SubtitleCue]) -> Int? {
@@ -465,20 +547,37 @@ final class AudioStudioController: ObservableObject {
         guard self.runID == runID else { return }
         stderrBuffer += chunk
         if stderrBuffer.count > 32_000 { stderrBuffer = String(stderrBuffer.suffix(16_000)) }
-        let pattern = #"progress\s*=\s*(\d+)%"#
-        guard let expression = try? NSRegularExpression(pattern: pattern),
-              let match = expression.matches(in: stderrBuffer, range: NSRange(stderrBuffer.startIndex..., in: stderrBuffer)).last,
-              let range = Range(match.range(at: 1), in: stderrBuffer),
-              let percent = Double(stderrBuffer[range]) else { return }
-        progress = 0.08 + min(100, percent) / 100 * 0.67
     }
 
-    private func loadWhisperResult(operation: AudioStudioOperation, targetLanguage: String,
-                                   chatPort: Int, routerModel: String?, glossary: String) {
-        guard let outputBase else { return }
-        let srtURL = outputBase.appendingPathExtension("srt")
-        let raw = (try? String(contentsOf: srtURL, encoding: .utf8)) ?? ""
-        let parsed = SubtitleCue.parseSRT(raw)
+    /// Counts the `request_index=` line the CLI prints as each span finishes.
+    private func consumeOutput(_ chunk: String, runID: UUID) {
+        guard self.runID == runID, segmentTotal > 0 else { return }
+        stdoutBuffer += chunk
+        var lines = stdoutBuffer.components(separatedBy: "\n")
+        stdoutBuffer = lines.removeLast()
+        finishedSegments += lines.filter { $0.hasPrefix("request_index=") }.count
+        progress = 0.08 + min(1, Double(finishedSegments) / Double(segmentTotal)) * 0.67
+    }
+
+    private func stopReadingPipes() {
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe = nil
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stdoutPipe = nil
+    }
+
+    private func loadTranscription(output: URL, spans: [ClosedRange<TimeInterval>],
+                                   job: AudioTranscriptionJob) {
+        var cues: [SubtitleCue] = []
+        for (index, span) in spans.enumerated() {
+            let name = Self.segmentName(index)
+            let text = (try? String(contentsOf: output.appendingPathComponent("text_\(name).txt"),
+                                    encoding: .utf8)) ?? ""
+            let words = (try? Data(contentsOf: output.appendingPathComponent("words_\(name).json")))
+                .map { SpeechTranscript.words(jsonData: $0, offset: span.lowerBound) } ?? []
+            cues += SpeechTranscript.cues(text: text, words: words, span: span)
+        }
+        let parsed = SpeechTranscript.numbered(cues)
         guard !parsed.isEmpty else {
             fail("No se detectó voz / no speech was detected.")
             return
@@ -487,25 +586,16 @@ final class AudioStudioController: ObservableObject {
         translatedCues = []
         transcriptMode = .original
         refreshVisibleCues()
-        readDetectedLanguage(outputBase.appendingPathExtension("json"))
+        detectedLanguage = job.language == "auto" ? "" : job.language
         saveRecovery()
-        if operation == .translateLocal {
-            translate(parsed, targetLanguage: targetLanguage, port: chatPort,
-                      routerModel: routerModel, glossary: glossary)
+        if job.operation == .translateLocal {
+            translate(parsed, targetLanguage: job.targetLanguage, port: job.chatPort,
+                      routerModel: job.routerModel, glossary: job.glossary)
         } else {
             complete()
         }
     }
 
-    private func readDetectedLanguage(_ url: URL) {
-        guard let data = try? Data(contentsOf: url),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if let result = root["result"] as? [String: Any], let language = result["language"] as? String {
-            detectedLanguage = language
-        } else if let language = root["language"] as? String {
-            detectedLanguage = language
-        }
-    }
 
     func retryTranslation(targetLanguage: String, port: Int,
                           routerModel: String?, glossary: String) {
@@ -1019,16 +1109,39 @@ final class AudioStudioController: ObservableObject {
     }
 
     private func restorePersistentModelIfNeeded() {
-        guard shouldRestorePersistentModel, let restoreModelURL else { return }
+        guard shouldRestorePersistentModel, let restoreModel, let restoreModelURL else { return }
         shouldRestorePersistentModel = false
-        SpeechDictationController.shared.preload(modelURL: restoreModelURL, gpuIndex: restoreGPUIndex)
+        SpeechDictationController.shared.preload(model: restoreModel, modelURL: restoreModelURL,
+                                                 gpuIndex: restoreGPUIndex)
     }
 
     private func cleanupWorkDirectory() {
         if let workDirectory { try? FileManager.default.removeItem(at: workDirectory) }
         workDirectory = nil
-        outputBase = nil
         stderrBuffer = ""
+        stdoutBuffer = ""
+        segmentTotal = 0
+        finishedSegments = 0
     }
 
+}
+
+/// Everything a transcription carries from the sidebar to the translation step.
+private struct AudioTranscriptionJob {
+    let model: SpeechModel
+    let modelURL: URL
+    let vadConfiguration: AudioVADConfiguration
+    let gpuIndex: Int
+    let language: String
+    let operation: AudioStudioOperation
+    let targetLanguage: String
+    let chatPort: Int
+    let routerModel: String?
+    let glossary: String
+}
+
+struct AudioStudioFailure: Error {
+    let message: String
+
+    init(_ message: String) { self.message = message }
 }

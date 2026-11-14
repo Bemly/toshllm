@@ -170,24 +170,37 @@ if [ -x "$IMAGE_STATIC/sd-cli" ]; then
     mkdir -p "$APP/Contents/Resources/bin-image"
     cp "$IMAGE_STATIC/sd-cli" "$APP/Contents/Resources/bin-image/"
     cp "$IMAGE_STATIC/default.metallib" "$APP/Contents/Resources/bin-image/"
+    if [ -x "$IMAGE_STATIC/sd-server" ]; then
+        cp "$IMAGE_STATIC/sd-server" "$APP/Contents/Resources/bin-image/"
+        echo "bundled sd-server (web UI + OpenAI image API)"
+    else
+        echo "WARNING: sd-server missing; image web UI / HTTP API unavailable" >&2
+    fi
     echo "bundled image generation engine"
 fi
 
-WHISPER_STATIC="vendor/whisper.cpp/build-static/bin"
-if [ -x "$WHISPER_STATIC/whisper-cli" ]; then
-    if [ ! -x "$WHISPER_STATIC/whisper-server" ]; then
-        echo "ERROR: whisper-server is required for the always-loaded speech mode; rebuild the engines" >&2
+# Speech-to-text engine (audio.cpp; optional). The ASR families load Silero VAD from
+# assets/framework/models relative to their working directory, which the app sets to bin-audio.
+AUDIO_STATIC="vendor/audio.cpp/build-static/bin"
+if [ -x "$AUDIO_STATIC/audiocpp_cli" ]; then
+    if [ ! -x "$AUDIO_STATIC/audiocpp_server" ]; then
+        echo "ERROR: audiocpp_server is required for the always-loaded speech mode; rebuild the engines" >&2
         exit 1
     fi
-    if [ ! -f "$WHISPER_STATIC/default.metallib" ]; then
-        echo "ERROR: Whisper.cpp default.metallib is required; rebuild the engines" >&2
+    if [ ! -f "$AUDIO_STATIC/assets/framework/models/silero_vad/silero_vad_16k.safetensors" ]; then
+        echo "ERROR: audio.cpp Silero VAD assets are missing; rebuild the engines" >&2
         exit 1
     fi
     mkdir -p "$APP/Contents/Resources/bin-audio"
-    cp "$WHISPER_STATIC/whisper-cli" "$WHISPER_STATIC/whisper-server" \
+    cp "$AUDIO_STATIC/audiocpp_cli" "$AUDIO_STATIC/audiocpp_server" \
        "$APP/Contents/Resources/bin-audio/"
-    cp "$WHISPER_STATIC/default.metallib" "$APP/Contents/Resources/bin-audio/"
-    echo "bundled Whisper.cpp speech-to-text engine"
+    cp -R "$AUDIO_STATIC/assets" "$APP/Contents/Resources/bin-audio/"
+    if [ -f "$AUDIO_STATIC/default.metallib" ]; then
+        cp "$AUDIO_STATIC/default.metallib" "$APP/Contents/Resources/bin-audio/"
+    else
+        echo "WARNING: no precompiled audio.cpp default.metallib; shaders compile on first use" >&2
+    fi
+    echo "bundled audio.cpp speech-to-text engine"
 fi
 
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -213,7 +226,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>NSLocalNetworkUsageDescription</key>
     <string>$APP_NAME can expose and advertise its local OpenAI-compatible API to devices on your trusted local network.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>$APP_NAME records audio only when you press the microphone button, for local Whisper transcription or an audio-capable model.</string>
+    <string>$APP_NAME records audio only when you press the microphone button, for local speech-to-text on this Mac or an audio-capable model.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>$APP_NAME uses Apple's on-device speech recognition only when you select Apple Dictation and press the microphone button.</string>
     <key>NSBonjourServices</key>
@@ -289,7 +302,7 @@ done
 
 [ -x "$APP/Contents/Resources/bin/llama-server" ] && codesign --force -s - "$APP/Contents/Resources/bin/"*(.)
 [ -x "$APP/Contents/Resources/bin-image/sd-cli" ] && codesign --force -s - "$APP/Contents/Resources/bin-image/"*
-[ -x "$APP/Contents/Resources/bin-audio/whisper-cli" ] && codesign --force -s - "$APP/Contents/Resources/bin-audio/"*
+[ -x "$APP/Contents/Resources/bin-audio/audiocpp_cli" ] && codesign --force -s - "$APP/Contents/Resources/bin-audio/"*(.)
 if [ -x "$APP/Contents/Resources/tosh-sympy/python/bin/python3" ]; then
     # NumPy and SciPy are made of extension modules and libraries: each is a Mach-O that needs its own signature
     codesign --force -s - "$APP/Contents/Resources/tosh-sympy/"**/*.(so|dylib)(.N) \

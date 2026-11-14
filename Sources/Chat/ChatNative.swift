@@ -2936,9 +2936,9 @@ struct NativeChatView: View {
     @State private var transcriptionQueue: [PendingSpeechTranscription] = []
     @AppStorage(SettingsKeys.modelPath) private var modelPath = ""
     @AppStorage(SettingsKeys.gpuIndex) private var gpuIndex = -1
-    @AppStorage(SettingsKeys.whisperModel) private var whisperModelID = WhisperModel.recommendedID
+    @AppStorage(SettingsKeys.speechModel) private var speechModelID = SpeechModel.recommendedID
     @AppStorage(SettingsKeys.speechInputMethod) private var speechInputMethodRaw = ""
-    @AppStorage(SettingsKeys.whisperLoadPolicy) private var whisperLoadPolicyRaw = WhisperLoadPolicy.onDemand.rawValue
+    @AppStorage(SettingsKeys.speechLoadPolicy) private var speechLoadPolicyRaw = SpeechLoadPolicy.onDemand.rawValue
     @State private var showSystem = false
     @State private var promptConversation: Conversation?
     @State private var promptProject: ChatProject?
@@ -2976,13 +2976,14 @@ struct NativeChatView: View {
         [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072].filter { $0 <= contextLimit }
     }
 
-    private var whisperLoadPolicy: WhisperLoadPolicy {
-        WhisperLoadPolicy(rawValue: whisperLoadPolicyRaw) ?? .onDemand
+    private var speechLoadPolicy: SpeechLoadPolicy {
+        SpeechLoadPolicy(rawValue: speechLoadPolicyRaw) ?? .onDemand
     }
 
-    private var whisperResidencyTaskID: String {
-        let model = WhisperModel.model(id: whisperModelID)
-        return "\(whisperLoadPolicyRaw)-\(whisperModelID)-\(gpuIndex)-\(models.whisperModelInstalled(model))-\(String(describing: server.state))"
+    private var speechModel: SpeechModel { SpeechModel.model(id: speechModelID) }
+
+    private var speechResidencyTaskID: String {
+        "\(speechLoadPolicyRaw)-\(speechModelID)-\(gpuIndex)-\(models.speechModelInstalled(speechModel))-\(String(describing: server.state))"
     }
 
     private var maxTokensIsLarge: Bool {
@@ -3097,8 +3098,8 @@ struct NativeChatView: View {
             .task(id: capabilityTaskID) {
                 await refreshModelModalities()
             }
-            .task(id: whisperResidencyTaskID) {
-                configureWhisperResidency()
+            .task(id: speechResidencyTaskID) {
+                configureSpeechResidency()
             }
             .sheet(item: $promptConversation) { c in
                 PromptEditorSheet(
@@ -4267,8 +4268,8 @@ struct NativeChatView: View {
         .popover(isPresented: $showVoiceOptions, arrowEdge: .top) {
             VoiceInputOptionsView(
                 methodRaw: $speechInputMethodRaw,
-                loadPolicyRaw: $whisperLoadPolicyRaw,
-                whisperModelID: $whisperModelID,
+                loadPolicyRaw: $speechLoadPolicyRaw,
+                speechModelID: $speechModelID,
                 dismiss: { showVoiceOptions = false })
                 .environmentObject(loc)
                 .environmentObject(models)
@@ -4281,18 +4282,18 @@ struct NativeChatView: View {
     private var voiceContextMenu: some View {
         Picker(loc.t("Método del micrófono", "Microphone method"), selection: $speechInputMethodRaw) {
             Text(loc.t("Dictado de Apple", "Apple Dictation")).tag(SpeechInputMethod.apple.rawValue)
-            Text("Whisper.cpp · GPU").tag(SpeechInputMethod.whisper.rawValue)
+            Text("audio.cpp · GPU").tag(SpeechInputMethod.audioCpp.rawValue)
         }
 
-        if speechInputMethodRaw == SpeechInputMethod.whisper.rawValue {
-            let selected = WhisperModel.model(id: whisperModelID)
-            Picker(loc.t("Carga de Whisper", "Whisper loading"), selection: $whisperLoadPolicyRaw) {
-                Text(loc.t("Bajo demanda", "On demand")).tag(WhisperLoadPolicy.onDemand.rawValue)
-                Text(loc.t("Siempre cargado", "Always loaded")).tag(WhisperLoadPolicy.alwaysLoaded.rawValue)
+        if speechInputMethodRaw == SpeechInputMethod.audioCpp.rawValue {
+            let selected = speechModel
+            Picker(loc.t("Carga del modelo de voz", "Speech model loading"), selection: $speechLoadPolicyRaw) {
+                Text(loc.t("Bajo demanda", "On demand")).tag(SpeechLoadPolicy.onDemand.rawValue)
+                Text(loc.t("Siempre cargado", "Always loaded")).tag(SpeechLoadPolicy.alwaysLoaded.rawValue)
             }
-            Menu(loc.t("Modelo Whisper", "Whisper model"), systemImage: "waveform.badge.magnifyingglass") {
-                Picker(loc.t("Modelo Whisper", "Whisper model"), selection: $whisperModelID) {
-                    ForEach(WhisperModel.catalog) { model in
+            Menu(loc.t("Modelo de voz", "Speech model"), systemImage: "waveform.badge.magnifyingglass") {
+                Picker(loc.t("Modelo de voz", "Speech model"), selection: $speechModelID) {
+                    ForEach(SpeechModel.catalog) { model in
                         Text("\(model.name) · \(model.sizeMB) MB").tag(model.id)
                     }
                 }
@@ -4300,17 +4301,17 @@ struct NativeChatView: View {
             if dictation.isModelKeptLoaded {
                 Label(loc.t("Modelo listo en la GPU", "Model ready on the GPU"),
                       systemImage: "memorychip.fill")
-                Button(loc.t("Detener y liberar Whisper", "Stop and unload Whisper"),
+                Button(loc.t("Detener y liberar el modelo de voz", "Stop and unload the speech model"),
                        systemImage: "stop.circle") {
                     dictation.shutdown()
                 }
             }
-            if !models.whisperModelInstalled(selected) {
-                if let download = models.whisperDownload(selected) {
+            if !models.speechModelInstalled(selected) {
+                if let download = models.speechDownload(selected) {
                     if download.error != nil {
                         Button(loc.t("Reintentar descarga", "Retry download"),
                                systemImage: "arrow.clockwise") {
-                            models.retryWhisperDownload(download)
+                            models.retrySpeechDownload(download)
                         }
                     } else if download.phase == .paused {
                         Button(loc.t("Reanudar descarga", "Resume download"),
@@ -4322,7 +4323,7 @@ struct NativeChatView: View {
                 } else {
                     Button(loc.t("Descargar %@", "Download %@", "\(selected.name)"),
                            systemImage: "arrow.down.circle") {
-                        models.downloadWhisperModel(selected)
+                        models.downloadSpeechModel(selected)
                     }
                 }
             }
@@ -4349,12 +4350,12 @@ struct NativeChatView: View {
 
     private var voiceButtonHelp: String {
         if dictation.isTranscribing {
-            return loc.t("Whisper.cpp está transcribiendo en la GPU; clic para cancelar.",
-                         "Whisper.cpp is transcribing on the GPU; click to cancel.")
+            return loc.t("audio.cpp está transcribiendo en la GPU; clic para cancelar.",
+                         "audio.cpp is transcribing on the GPU; click to cancel.")
         }
         if dictation.isDictating {
-            return loc.t("Escuchando con Whisper… clic para transcribir.",
-                         "Listening with Whisper… click to transcribe.")
+            return loc.t("Escuchando con audio.cpp… clic para transcribir.",
+                         "Listening with audio.cpp… click to transcribe.")
         }
         if appleDictation.isDictating {
             return loc.t("Dictado de Apple activo; clic para detener.",
@@ -4380,7 +4381,7 @@ struct NativeChatView: View {
         }
         switch method {
         case .apple: startAppleDictation()
-        case .whisper: startWhisperDictation()
+        case .audioCpp: startSpeechDictation()
         }
     }
 
@@ -4395,16 +4396,16 @@ struct NativeChatView: View {
         appleDictation.toggle { draft = dictationBase + $0 }
     }
 
-    private func startWhisperDictation() {
+    private func startSpeechDictation() {
         prepareDictationBase()
-        let model = WhisperModel.model(id: whisperModelID)
-        guard models.whisperModelInstalled(model) else {
+        let model = speechModel
+        guard models.speechModelInstalled(model) else {
             showVoiceOptions = true
             return
         }
-        dictation.toggle(modelURL: model.url(in: models.whisperDirectory),
+        dictation.toggle(model: model, modelURL: model.url(in: models.speechDirectory),
                          gpuIndex: gpuIndex,
-                         loadPolicy: whisperLoadPolicy) {
+                         loadPolicy: speechLoadPolicy) {
             draft = dictationBase + $0
         }
     }
@@ -4416,10 +4417,10 @@ struct NativeChatView: View {
 
     private func stopVoice() {
         if dictation.isDictating {
-            let model = WhisperModel.model(id: whisperModelID)
-            dictation.toggle(modelURL: model.url(in: models.whisperDirectory),
+            let model = speechModel
+            dictation.toggle(model: model, modelURL: model.url(in: models.speechDirectory),
                              gpuIndex: gpuIndex,
-                             loadPolicy: whisperLoadPolicy) {
+                             loadPolicy: speechLoadPolicy) {
                 draft = dictationBase + $0
             }
         } else if dictation.isTranscribing {
@@ -4429,19 +4430,19 @@ struct NativeChatView: View {
         if audioRecorder.isRecording { audioRecorder.toggle { attachments.append($0) } }
     }
 
-    private func configureWhisperResidency() {
-        guard whisperLoadPolicy == .alwaysLoaded else {
+    private func configureSpeechResidency() {
+        guard speechLoadPolicy == .alwaysLoaded else {
             dictation.unloadPersistentModel()
             return
         }
-        // Do not reload Whisper after an explicit engine stop.
+        // Do not reload the speech model after an explicit engine stop.
         guard server.state == .starting || server.state == .running else {
             dictation.unloadPersistentModel()
             return
         }
-        let model = WhisperModel.model(id: whisperModelID)
-        guard models.whisperModelInstalled(model) else { return }
-        dictation.preload(modelURL: model.url(in: models.whisperDirectory), gpuIndex: gpuIndex)
+        let model = speechModel
+        guard models.speechModelInstalled(model) else { return }
+        dictation.preload(model: model, modelURL: model.url(in: models.speechDirectory), gpuIndex: gpuIndex)
     }
 
     private func stopSpeechSubsystem() {
@@ -4803,19 +4804,19 @@ struct NativeChatView: View {
                     errors.append(loc.t("%@: termina primero el dictado del micrófono", "%@: finish microphone dictation first", "\(name)"))
                     continue
                 }
-                let model = WhisperModel.model(id: whisperModelID)
-                guard models.whisperModelInstalled(model) else {
-                    models.downloadWhisperModel(model)
+                let model = speechModel
+                guard models.speechModelInstalled(model) else {
+                    models.downloadSpeechModel(model)
                     errors.append(loc.t("%@: descarga primero %@ para transcribirlo", "%@: download %@ first to transcribe it", "\(name)", "\(model.name)"))
                     continue
                 }
                 let pendingID = UUID()
                 attachments.append(ChatAttachment(
                     id: pendingID, name: name,
-                    content: loc.t("(transcribiendo localmente con Whisper.cpp…)",
-                                   "(transcribing locally with Whisper.cpp…)")))
+                    content: loc.t("(transcribiendo localmente con audio.cpp…)",
+                                   "(transcribing locally with audio.cpp…)")))
                 transcriptionQueue.append(PendingSpeechTranscription(
-                    id: UUID(), fileURL: url, modelURL: model.url(in: models.whisperDirectory),
+                    id: UUID(), fileURL: url, model: model, modelURL: model.url(in: models.speechDirectory),
                     attachmentID: pendingID, name: name))
                 transcriptionPending += 1
                 startNextFileTranscription()
@@ -4919,9 +4920,10 @@ struct NativeChatView: View {
         guard !dictation.isTranscribing, !dictation.isDictating, !appleDictation.isDictating,
               let pending = transcriptionQueue.first else { return }
         dictation.transcribe(fileURL: pending.fileURL,
+                             model: pending.model,
                              modelURL: pending.modelURL,
                              gpuIndex: gpuIndex,
-                             loadPolicy: whisperLoadPolicy) { transcript in
+                             loadPolicy: speechLoadPolicy) { transcript in
             completeFileTranscription(pending, transcript: transcript)
         } onFailure: {
             failFileTranscription(pending)

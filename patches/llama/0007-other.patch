@@ -1,0 +1,4092 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 56bd42757..f60def259 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,16 +134,18 @@ option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
+ set(LLAMA_KVMEM_ROOT "" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)")
+ if (LLAMA_KVMEM AND LLAMA_KVMEM_ROOT STREQUAL "")
+     # Vendored snapshot in this fork; pass -DLLAMA_KVMEM_ROOT=... to
+     # build against a live kvmem-llama.cpp checkout instead.
+     set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/kvmem-upstream" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)" FORCE)
+ endif()
+ 
+ # extra artifacts
++option(TOSH_ENABLE_DYNAMIC_MOE "tosh: dynamic MoE expert execution" OFF)
++
+ option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
+ option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
+ option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
+ option(LLAMA_CONNECT         "llama: include the llama-connect tool (downloads a prebuilt binary)"               OFF)
+diff --git a/cmake/build-info.cmake b/cmake/build-info.cmake
+index c7005950c..5262e4ce8 100644
+--- a/cmake/build-info.cmake
++++ b/cmake/build-info.cmake
+@@ -38,11 +38,15 @@ if(Git_FOUND)
+         set(BUILD_NUMBER ${COUNT})
+     endif()
+ endif()
+ 
+ set(BUILD_COMPILER "${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
+ 
+ if(CMAKE_VS_PLATFORM_NAME)
+     set(BUILD_TARGET ${CMAKE_VS_PLATFORM_NAME})
++elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
++    # cross-building on Apple leaves CMAKE_SYSTEM_PROCESSOR on the host arch, which then
++    # reports an arm64 build for an x86_64 binary
++    set(BUILD_TARGET "${CMAKE_SYSTEM_NAME} ${CMAKE_OSX_ARCHITECTURES}")
+ else()
+     set(BUILD_TARGET "${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
+diff --git a/examples/training/CMakeLists.txt b/examples/training/CMakeLists.txt
+index 8bb20d0f2..890f29ac4 100644
+--- a/examples/training/CMakeLists.txt
++++ b/examples/training/CMakeLists.txt
+@@ -1,5 +1,11 @@
+ set(TARGET llama-finetune)
+ add_executable(${TARGET} finetune.cpp)
+ install(TARGETS ${TARGET} RUNTIME)
+ target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+ target_compile_features(${TARGET} PRIVATE cxx_std_11)
++
++set(TARGET llama-finetune-lora)
++add_executable(${TARGET} finetune-lora.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_11)
+diff --git a/examples/training/finetune-lora.cpp b/examples/training/finetune-lora.cpp
+new file mode 100644
+index 000000000..324e4b72e
+--- /dev/null
++++ b/examples/training/finetune-lora.cpp
+@@ -0,0 +1,1029 @@
++#include "arg.h"
++#include "common.h"
++#include "finetune.h"
++#include "log.h"
++#include "llama.h"
++#include "ggml-backend.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cinttypes>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <iomanip>
++#include <vector>
++#include <fstream>
++#include <filesystem>
++#include <cstdlib>
++
++#if defined(_MSC_VER)
++#pragma warning(disable: 4244 4267) // possible loss of data
++#endif
++
++
++struct checkpoint_callback_data;
++static checkpoint_callback_data* g_checkpoint_data = nullptr;
++
++enum class lora_lr_schedule_type : std::uint8_t {
++    CONSTANT,
++    COSINE,
++    LINEAR,
++};
++
++struct lora_lr_scheduler_state {
++    lora_lr_schedule_type schedule = lora_lr_schedule_type::CONSTANT;
++    float lr_init = 1e-5f;
++    float lr_min = 0.0f;
++    float weight_decay = 0.0f;
++    int64_t total_steps = 0;
++    int64_t current_step = 0;
++    float last_lr = 0.0f;
++    float warmup_ratio = 0.0f;
++    int64_t warmup_steps = 0;
++};
++
++static bool lora_lr_scheduler_type_from_string(const std::string & name, lora_lr_schedule_type & out) {
++    auto equals = [](const std::string & lhs, const char * rhs) {
++        const size_t rhs_len = std::strlen(rhs);
++        if (lhs.size() != rhs_len) {
++            return false;
++        }
++        for (size_t i = 0; i < rhs_len; ++i) {
++            if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
++                std::tolower(static_cast<unsigned char>(rhs[i]))) {
++                return false;
++            }
++        }
++        return true;
++    };
++
++    if (equals(name, "constant")) {
++        out = lora_lr_schedule_type::CONSTANT;
++        return true;
++    }
++    if (equals(name, "cosine")) {
++        out = lora_lr_schedule_type::COSINE;
++        return true;
++    }
++    if (equals(name, "linear")) {
++        out = lora_lr_schedule_type::LINEAR;
++        return true;
++    }
++    return false;
++}
++
++static const char * lora_lr_scheduler_type_to_cstr(lora_lr_schedule_type type) {
++    switch (type) {
++        case lora_lr_schedule_type::LINEAR: return "linear";
++        case lora_lr_schedule_type::COSINE: return "cosine";
++        case lora_lr_schedule_type::CONSTANT: return "constant";
++    }
++    return "constant";
++}
++
++static float lora_scheduler_lr_for_step(const lora_lr_scheduler_state & state, int64_t step) {
++
++    if (state.total_steps <= 0) {
++        return std::max(state.lr_init, 0.0f);
++    }
++
++    const int64_t clamped_step = std::min<int64_t>(std::max<int64_t>(step, 0), state.total_steps);
++    const int64_t warmup_steps = std::min<int64_t>(std::max<int64_t>(state.warmup_steps, 0), state.total_steps);
++
++    if (warmup_steps > 0 && clamped_step < warmup_steps) {
++        const float warmup_progress = static_cast<float>(clamped_step) / static_cast<float>(warmup_steps);
++        const float lr = state.lr_init * warmup_progress;
++        return std::max(lr, 0.0f);
++    }
++
++    const int64_t adjusted_step = clamped_step - warmup_steps;
++    int64_t remaining_steps = state.total_steps - warmup_steps;
++    if (remaining_steps <= 0) {
++        remaining_steps = 1;
++    }
++
++    const float progress = std::min<float>(static_cast<float>(adjusted_step) / static_cast<float>(remaining_steps), 1.0f);
++    float lr = state.lr_init;
++
++    switch (state.schedule) {
++        case lora_lr_schedule_type::CONSTANT:
++            lr = state.lr_init;
++            break;
++        case lora_lr_schedule_type::COSINE: {
++            constexpr float kPi = 3.14159265358979323846f;
++            const float cosine = 0.5f * (1.0f + std::cos(progress * kPi));
++            lr = state.lr_min + (state.lr_init - state.lr_min) * cosine;
++            break;
++        }
++        case lora_lr_schedule_type::LINEAR: {
++            lr = state.lr_init + (state.lr_min - state.lr_init) * progress;
++            break;
++        }
++    }
++
++    return std::max(lr, 0.0f);
++}
++
++static struct ggml_opt_optimizer_params lora_scheduler_get_optimizer_params(void * userdata) {
++    auto * scheduler = static_cast<lora_lr_scheduler_state *>(userdata);
++    struct ggml_opt_optimizer_params params = ggml_opt_get_default_optimizer_params(nullptr);
++
++    if (!scheduler) {
++        return params;
++    }
++
++    const float lr = lora_scheduler_lr_for_step(*scheduler, scheduler->current_step+1);
++    scheduler->last_lr = lr;
++
++    params.adamw.alpha = lr;
++        params.adamw.wd = scheduler->weight_decay;
++
++    params.sgd.alpha = lr;
++    params.sgd.wd = scheduler->weight_decay;
++
++    if (scheduler->current_step < scheduler->total_steps) {
++        scheduler->current_step++;
++    }
++
++    return params;
++}
++
++static uint32_t parse_lora_modules(const std::string& modules_str) {
++    if (modules_str.empty()) {
++        return LLAMA_LORA_TARGET_ATTN_Q | LLAMA_LORA_TARGET_ATTN_K | LLAMA_LORA_TARGET_ATTN_V | LLAMA_LORA_TARGET_ATTN_O;
++    }
++
++    static const std::map<std::string, uint32_t> module_map = {
++        {"attn_q",           LLAMA_LORA_TARGET_ATTN_Q},
++        {"attn_k",           LLAMA_LORA_TARGET_ATTN_K},
++        {"attn_v",           LLAMA_LORA_TARGET_ATTN_V},
++        {"attn_o",           LLAMA_LORA_TARGET_ATTN_O},
++        {"ffn_gate",         LLAMA_LORA_TARGET_FFN_GATE},
++        {"ffn_up",           LLAMA_LORA_TARGET_FFN_UP},
++        {"ffn_down",         LLAMA_LORA_TARGET_FFN_DOWN},
++        {"output",           LLAMA_LORA_TARGET_OUTPUT},
++        {"ffn_gate_exps",    LLAMA_LORA_TARGET_FFN_GATE_EXPS},
++        {"ffn_up_exps",      LLAMA_LORA_TARGET_FFN_UP_EXPS},
++        {"ffn_down_exps",    LLAMA_LORA_TARGET_FFN_DOWN_EXPS},
++        {"ffn_gate_up_exps", LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
++        {"moe_experts",      LLAMA_LORA_TARGET_FFN_GATE_EXPS |
++                             LLAMA_LORA_TARGET_FFN_UP_EXPS |
++                             LLAMA_LORA_TARGET_FFN_DOWN_EXPS |
++                             LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
++        {"all",              LLAMA_LORA_TARGET_ALL}
++    };
++
++    uint32_t target_modules = 0;
++    std::stringstream ss(modules_str);
++    std::string module;
++
++    while (std::getline(ss, module, ',')) {
++        module.erase(0, module.find_first_not_of(" \t"));
++        module.erase(module.find_last_not_of(" \t") + 1);
++
++        auto it = module_map.find(module);
++        if (it != module_map.end()) {
++            target_modules |= it->second;
++            LOG_INF("Added target module: %s\n", module.c_str());
++        } else {
++            LOG_ERR("Unknown LoRA target module: %s\n", module.c_str());
++            LOG_ERR("Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps, moe_experts, all\n");
++            return 0;
++        }
++    }
++
++    return target_modules;
++}
++
++static bool training_supports_out_prod_f16(const common_params & params) {
++    std::vector<ggml_backend_dev_t> devices;
++
++    if (!params.devices.empty()) {
++        devices.assign(params.devices.begin(), params.devices.end());
++    } else {
++        ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        if (gpu) {
++            devices.push_back(gpu);
++        }
++    }
++
++    if (devices.empty()) {
++        return true;
++    }
++
++    constexpr int64_t ne0 = 4;
++    constexpr int64_t ne1 = 3;
++    constexpr int64_t k   = 2;
++
++    struct ggml_tensor src0 = {};
++    struct ggml_tensor src1 = {};
++    struct ggml_tensor dst  = {};
++
++    src0.type = GGML_TYPE_F16;
++    src1.type = GGML_TYPE_F32;
++    dst.type  = GGML_TYPE_F32;
++
++    src0.ne[0] = ne0; src0.ne[1] = k;   src0.ne[2] = 1; src0.ne[3] = 1;
++    src1.ne[0] = ne1; src1.ne[1] = k;   src1.ne[2] = 1; src1.ne[3] = 1;
++    dst.ne [0] = ne0; dst.ne [1] = ne1; dst.ne [2] = 1; dst.ne [3] = 1;
++
++    src0.nb[0] = sizeof(ggml_fp16_t);
++    src0.nb[1] = src0.nb[0] * ne0;
++    src0.nb[2] = src0.nb[1] * k;
++    src0.nb[3] = src0.nb[2] * 1;
++
++    src1.nb[0] = sizeof(float);
++    src1.nb[1] = src1.nb[0] * ne1;
++    src1.nb[2] = src1.nb[1] * k;
++    src1.nb[3] = src1.nb[2] * 1;
++
++    dst.nb[0] = sizeof(float);
++    dst.nb[1] = dst.nb[0] * ne0;
++    dst.nb[2] = dst.nb[1] * ne1;
++    dst.nb[3] = dst.nb[2] * 1;
++
++    dst.op     = GGML_OP_OUT_PROD;
++    dst.src[0] = &src0;
++    dst.src[1] = &src1;
++
++    for (ggml_backend_dev_t dev : devices) {
++        if (dev == nullptr) {
++            continue;
++        }
++        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++            continue;
++        }
++        if (!ggml_backend_dev_supports_op(dev, &dst)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static void print_lora_usage() {
++    printf("\n----- LoRA Fine-tuning Parameters -----\n");
++    printf("  --lora-rank N              LoRA rank (default: 8, range: 1-512)\n");
++    printf("  --lora-alpha N             LoRA alpha scaling factor (default: 16.0, range: 0.1-1000.0)\n");
++    printf("  --lora-modules MODULES     Target modules as comma-separated list (default: attn_q,attn_k,attn_v,attn_o)\n");
++    printf("                             Available modules: attn_q, attn_k, attn_v, attn_o, ffn_gate, ffn_up, ffn_down, output,\n");
++    printf("                                                ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps, moe_experts, all\n");
++    printf("                             Examples: \"attn_q,attn_v\" or \"all\" or \"attn_q,attn_k,attn_v,attn_o,ffn_gate,ffn_up,ffn_down\"\n");
++    printf("                                       \"attn_q,attn_v,moe_experts\" (MoE expert LoRA)\n");
++    printf("  --output-adapter PATH      Output path for trained adapter (default: auto-generated)\n");
++    printf("\nTraining Options:\n");
++    printf("  --num-epochs N             Number of training epochs (default: 1)\n");
++    printf("  --assistant-loss-only      Use JSON dataset format with masked loss (ChatML/conversation format)\n");
++    printf("                             Only computes loss on assistant responses, not system/user prompts\n");
++    printf("  --train-flash-attn         Keep flash attention enabled during training (needs FLASH_ATTN_EXT_BACK on the backend)\n");
++    printf("  --chat-template PATH  Optional Jinja chat template to render JSON dataset (matches HF apply_chat_template)\n");
++    printf("  --learning-rate F          AdamW learning rate (default: 1e-5)\n");
++    printf("  --weight-decay F           AdamW weight decay (default: 1e-2)\n");
++    printf("  --lr-scheduler TYPE        Learning rate scheduler: constant, cosine, linear (default: constant)\n");
++    printf("  --lr-min F                 Minimum LR for cosine/linear schedulers (default: 0)\n");
++    printf("  --warmup-ratio F           Fraction of total steps for LR warmup (default: 0.0)\n");
++    printf("  --warmup-steps N           Explicit warmup steps (overrides warmup-ratio)\n");
++    printf("\nCheckpointing Options:\n");
++    printf("  --checkpoint-save-steps N  Save checkpoint every N training steps (default: 100)\n");
++    printf("  --checkpoint-save-dir PATH Directory for checkpoints (default: ./checkpoints)\n");
++    printf("  --resume-from PATH         Resume training from specific checkpoint file\n");
++    printf("  --auto-resume              Automatically resume from latest checkpoint in save dir\n");
++    printf("\nExamples:\n");
++    printf("  # Train with rank=16, alpha=32, all attention modules\n");
++    printf("  %s -m model.gguf -f dataset.txt --lora-rank 16 --lora-alpha 32 --lora-modules attn_q,attn_k,attn_v,attn_o\n", "finetune-lora");
++    printf("\n  # Fine-tune existing adapter with all modules\n");
++    printf("  %s -m model.gguf -f dataset.txt --lora existing.gguf --output-adapter improved.gguf\n", "finetune-lora");
++    printf("\n  # Instruction fine-tuning with ChatML format\n");
++    printf("  %s -m model.gguf -f conversations.jsonl --assistant-loss-only --lora-rank 16\n", "finetune-lora");
++    printf("\n");
++}
++
++struct checkpoint_metadata {
++    int32_t epoch;
++    int32_t lora_rank;
++    float lora_alpha;
++    uint32_t target_modules;
++};
++
++static std::string get_checkpoint_filename(const std::string& checkpoint_dir, int64_t step) {
++    std::ostringstream oss;
++    oss << checkpoint_dir << "/checkpoint_step_" << std::setfill('0') << std::setw(8) << step;
++    return oss.str();
++}
++
++static std::string find_latest_checkpoint(const std::string& checkpoint_dir) {
++    if (!std::filesystem::exists(checkpoint_dir)) {
++        return "";
++    }
++
++    std::string latest_checkpoint;
++    int64_t latest_step = -1;
++
++    for (const auto& entry : std::filesystem::directory_iterator(checkpoint_dir)) {
++        if (entry.is_directory()) {
++            std::string dirname = entry.path().filename().string();
++            if (dirname.find("checkpoint_step_") == 0 && dirname.size() >= 16) {
++                std::string step_str = dirname.substr(16, 8);
++                try {
++                    int64_t step = std::stoll(step_str);
++                    if (step > latest_step) {
++                        latest_step = step;
++                        latest_checkpoint = entry.path().string();
++                    }
++                } catch (const std::exception&) {
++                    continue;
++                }
++            }
++        }
++    }
++
++    return latest_checkpoint;
++}
++
++static bool save_checkpoint(llama_context* ctx, llama_adapter_lora* adapter,  const checkpoint_metadata& metadata, const std::string& checkpoint_dir) {
++    if (!std::filesystem::exists(checkpoint_dir)) {
++        if (!std::filesystem::create_directories(checkpoint_dir)) {
++            LOG_ERR("Failed to create checkpoint directory: %s\n", checkpoint_dir.c_str());
++            return false;
++        }
++    }
++
++    if (!llama_lora_save_checkpoint(adapter, checkpoint_dir.c_str(), llama_get_model(ctx), ctx)) {
++        LOG_ERR("Failed to save LoRA checkpoint\n");
++        return false;
++    }
++
++    std::string meta_path = checkpoint_dir + "/metadata.txt";
++    std::ofstream meta_file(meta_path);
++    if (meta_file.is_open()) {
++        meta_file << "epoch=" << metadata.epoch << "\n";
++        meta_file << "lora_rank=" << metadata.lora_rank << "\n";
++        meta_file << "lora_alpha=" << metadata.lora_alpha << "\n";
++        meta_file << "target_modules=" << metadata.target_modules << "\n";
++        meta_file.close();
++    } else {
++        LOG_ERR("Failed to save checkpoint metadata\n");
++        return false;
++    }
++
++    LOG_INF("Checkpoint saved successfully to %s\n", checkpoint_dir.c_str());
++    return true;
++}
++
++static bool validate_checkpoint_metadata(const std::string& checkpoint_path, checkpoint_metadata& metadata) {
++    std::string checkpoint_dir = checkpoint_path;
++
++    if (!std::filesystem::exists(checkpoint_dir)) {
++        LOG_ERR("Checkpoint directory does not exist: %s\n", checkpoint_dir.c_str());
++        return false;
++    }
++
++    LOG_INF("Loading checkpoint from: %s\n", checkpoint_dir.c_str());
++
++    std::string meta_path = checkpoint_dir + "/metadata.txt";
++    if (std::filesystem::exists(meta_path)) {
++        std::ifstream meta_file(meta_path);
++        if (meta_file.is_open()) {
++            std::string line;
++            while (std::getline(meta_file, line)) {
++                size_t eq_pos = line.find('=');
++                if (eq_pos != std::string::npos) {
++                    std::string key = line.substr(0, eq_pos);
++                    std::string value = line.substr(eq_pos + 1);
++
++                    if (key == "epoch") {
++                        metadata.epoch = std::stoi(value);
++                    } else if (key == "lora_rank") {
++                        metadata.lora_rank = std::stoi(value);
++                    } else if (key == "lora_alpha") {
++                        metadata.lora_alpha = std::stof(value);
++                    } else if (key == "target_modules") {
++                        metadata.target_modules = std::stoul(value);
++                    }
++                }
++            }
++            meta_file.close();
++        } else {
++            LOG_ERR("Failed to open checkpoint metadata file\n");
++            return false;
++        }
++    } else {
++        LOG_ERR("Checkpoint metadata file not found: %s\n", meta_path.c_str());
++        return false;
++    }
++
++    LOG_INF("Checkpoint loaded successfully\n");
++    return true;
++}
++
++
++struct checkpoint_callback_data {
++    llama_context* ctx;
++    llama_adapter_lora* adapter;
++    int32_t checkpoint_save_steps;
++    std::string checkpoint_save_dir;
++    int64_t global_step;
++    int64_t initial_step;
++    int32_t current_epoch;
++    int32_t lora_rank;
++    float lora_alpha;
++    uint32_t target_modules;
++    float learning_rate;
++    lora_lr_scheduler_state * lr_scheduler;
++    std::string model_path;
++    std::string dataset_path;
++};
++
++static void checkpoint_progress_callback(
++        bool               train,
++        ggml_opt_context_t opt_ctx,
++        ggml_opt_dataset_t dataset,
++        ggml_opt_result_t  result,
++        int64_t            ibatch,
++        int64_t            ibatch_max,
++        int64_t            t_start_us) {
++    ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
++
++    if (!train) return;
++
++    checkpoint_callback_data* cb_data = g_checkpoint_data;
++
++    if (!cb_data) {
++        LOG_ERR("Checkpoint callback data is null!\n");
++        return;
++    }
++
++    if (cb_data->lr_scheduler) {
++        cb_data->learning_rate = lora_scheduler_lr_for_step(*cb_data->lr_scheduler, cb_data->lr_scheduler->current_step+1);
++    }
++
++    if (cb_data->checkpoint_save_steps <= 0) {
++        return;
++    }
++
++    cb_data->global_step++;
++
++    if (cb_data->global_step % cb_data->checkpoint_save_steps == 0) {
++        if (!cb_data->ctx) {
++            LOG_ERR("Context is null in checkpoint callback!\n");
++            return;
++        }
++
++        if (!cb_data->adapter) {
++            LOG_ERR("LoRA adapter is null in checkpoint callback!\n");
++            return;
++        }
++
++        checkpoint_metadata meta = {
++            /*epoch          =*/ cb_data->current_epoch,
++            /*lora_rank      =*/ cb_data->lora_rank,
++            /*lora_alpha     =*/ cb_data->lora_alpha,
++            /*target_modules =*/ cb_data->target_modules,
++        };
++
++        std::string checkpoint_path = get_checkpoint_filename(cb_data->checkpoint_save_dir, cb_data->global_step);
++
++        if (!save_checkpoint(cb_data->ctx, cb_data->adapter, meta, checkpoint_path)) {
++            LOG_ERR("Failed to save checkpoint at step %" PRId64 "\n", cb_data->global_step);
++        }
++    }
++}
++
++struct finetune_params {
++    int32_t lora_rank = 8;
++    float lora_alpha = 16.0f;
++    std::string lora_modules_str;
++    std::string output_adapter_path;
++
++    int32_t num_epochs = 1;
++    float learning_rate = 1e-5f;
++    float lr_min = 0.0f;
++    float weight_decay = 0.01f;
++    std::string lr_scheduler = "constant";
++    float warmup_ratio = 0.0f;
++    int64_t warmup_steps = 0;
++    bool warmup_ratio_set = false;
++    bool warmup_steps_set = false;
++
++    int32_t checkpoint_save_steps = 100;
++    std::string checkpoint_save_dir = "./checkpoints";
++    std::string resume_from_checkpoint;
++    bool auto_resume = false;
++    std::string chat_template_path;
++    bool assistant_loss_only = false;
++    bool train_flash_attn = false;
++    uint32_t lora_seed = 42;
++    float grad_clip = 1.0f; // global gradient norm clipped before each step, 0 = off
++};
++
++static bool parse_finetune_args(int& argc, char** argv, finetune_params& ft_params) {
++    auto remove_arg_pair = [&](int i) {
++        for (int j = i; j < argc - 2; j++) {
++            argv[j] = argv[j + 2];
++        }
++        argc -= 2;
++    };
++
++    auto remove_arg_single = [&](int i) {
++        for (int j = i; j < argc - 1; j++) {
++            argv[j] = argv[j + 1];
++        }
++        argc -= 1;
++    };
++
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "--assistant-loss-only") == 0) {
++            ft_params.assistant_loss_only = true;
++            remove_arg_single(i);
++            i--;
++        }
++    }
++
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "--train-flash-attn") == 0) {
++            ft_params.train_flash_attn = true;
++            remove_arg_single(i);
++            i--;
++        }
++    }
++
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "--lora-rank") == 0 && i + 1 < argc) {
++            ft_params.lora_rank = std::atoi(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--lora-alpha") == 0 && i + 1 < argc) {
++            ft_params.lora_alpha = std::atof(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--grad-clip") == 0 && i + 1 < argc) {
++            ft_params.grad_clip = std::atof(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--lora-seed") == 0 && i + 1 < argc) {
++    printf("  --grad-clip F              Clip the global gradient norm to F before each step, 0 = off (default: 1.0)\n");
++            ft_params.lora_seed = std::strtoul(argv[i + 1], nullptr, 10);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--lora-modules") == 0 && i + 1 < argc) {
++            ft_params.lora_modules_str = argv[i + 1];
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--output-adapter") == 0 && i + 1 < argc) {
++            ft_params.output_adapter_path = argv[i + 1];
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--num-epochs") == 0 && i + 1 < argc) {
++            ft_params.num_epochs = std::atoi(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
++            ft_params.learning_rate = std::atof(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--weight-decay") == 0 && i + 1 < argc) {
++            ft_params.weight_decay = std::atof(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--lr-scheduler") == 0 && i + 1 < argc) {
++            ft_params.lr_scheduler = argv[i + 1];
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--lr-min") == 0 && i + 1 < argc) {
++            ft_params.lr_min = std::atof(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--warmup-ratio") == 0 && i + 1 < argc) {
++            ft_params.warmup_ratio = std::atof(argv[i + 1]);
++            ft_params.warmup_ratio_set = true;
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--warmup-steps") == 0 && i + 1 < argc) {
++            ft_params.warmup_steps = std::atoll(argv[i + 1]);
++            ft_params.warmup_steps_set = true;
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--checkpoint-save-steps") == 0 && i + 1 < argc) {
++            ft_params.checkpoint_save_steps = std::atoi(argv[i + 1]);
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--checkpoint-save-dir") == 0 && i + 1 < argc) {
++            ft_params.checkpoint_save_dir = argv[i + 1];
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--resume-from") == 0 && i + 1 < argc) {
++            ft_params.resume_from_checkpoint = argv[i + 1];
++            remove_arg_pair(i);
++            i--;
++        } else if (strcmp(argv[i], "--auto-resume") == 0) {
++            ft_params.auto_resume = true;
++            for (int j = i; j < argc - 1; j++) {
++                argv[j] = argv[j + 1];
++            }
++            argc--;
++            i--;
++        } else if (strcmp(argv[i], "--chat-template") == 0 && i + 1 < argc) {
++            ft_params.chat_template_path = argv[i + 1];
++            remove_arg_pair(i);
++            i--;
++        }
++    }
++
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
++            print_lora_usage();
++        }
++    }
++
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    // a training step runs for seconds on the GPU: bounded command buffers keep the screen drawing and stay
++    // under the system's per-buffer time limit (the caller can override or disable with 0)
++    setenv("TOSH_CB_MAX_NODES", "64", 0);
++
++    common_params params;
++    finetune_params ft_params;
++
++    params.escape = false;
++    // the CPU only computes the input embedding of each step: its threads wait without spinning, which
++    // otherwise keeps several cores busy while the GPU runs (--poll overrides it)
++    params.cpuparams.poll       = 0;
++    params.cpuparams_batch.poll = 0;
++    parse_finetune_args(argc, argv, ft_params);
++
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PERPLEXITY)) {
++        return 1;
++    }
++
++    lora_lr_schedule_type scheduler_type;
++    if (!lora_lr_scheduler_type_from_string(ft_params.lr_scheduler, scheduler_type)) {
++        LOG_ERR("Unknown learning rate scheduler: %s (expected: constant, cosine, linear)\n", ft_params.lr_scheduler.c_str());
++        return 1;
++    }
++
++    if (ft_params.num_epochs <= 0) {
++        LOG_ERR("Number of epochs must be > 0, got %d\n", ft_params.num_epochs);
++        return 1;
++    }
++    if (ft_params.learning_rate <= 0.0f) {
++        LOG_ERR("Learning rate must be > 0, got %.4e\n", ft_params.learning_rate);
++        return 1;
++    }
++    if (ft_params.weight_decay < 0.0f) {
++        LOG_ERR("Weight decay must be >= 0, got %.4e\n", ft_params.weight_decay);
++        return 1;
++    }
++    if (ft_params.lr_min < 0.0f) {
++        LOG_ERR("Minimum learning rate must be >= 0, got %.4e\n", ft_params.lr_min);
++        return 1;
++    }
++    const bool scheduler_uses_lr_min = scheduler_type == lora_lr_schedule_type::COSINE ||
++                                       scheduler_type == lora_lr_schedule_type::LINEAR;
++    if (scheduler_uses_lr_min && ft_params.lr_min > ft_params.learning_rate) {
++        LOG_ERR("For %s scheduler lr-min (%.4e) cannot exceed learning-rate (%.4e)\n",
++                lora_lr_scheduler_type_to_cstr(scheduler_type), ft_params.lr_min, ft_params.learning_rate);
++        return 1;
++    }
++
++    LOG_INF("Using LoRA parameters: rank=%d, alpha=%.1f, seed=%u\n", ft_params.lora_rank, ft_params.lora_alpha, ft_params.lora_seed);
++    LOG_INF("Training for %d epochs\n", ft_params.num_epochs);
++
++    // Handle checkpoint auto-resume before model initialization
++    if (ft_params.auto_resume && ft_params.resume_from_checkpoint.empty()) {
++        std::string latest_checkpoint = find_latest_checkpoint(ft_params.checkpoint_save_dir);
++        if (!latest_checkpoint.empty()) {
++            ft_params.resume_from_checkpoint = latest_checkpoint;
++            LOG_INF("Auto-resume: found checkpoint %s\n", ft_params.resume_from_checkpoint.c_str());
++        }
++    }
++
++    if (!ft_params.resume_from_checkpoint.empty()) {
++        params.warmup = false;
++    }
++
++    // Load checkpoint LoRA adapter from directory structure (model.gguf)
++    if (!ft_params.resume_from_checkpoint.empty()) {
++        std::filesystem::path checkpoint_dir(ft_params.resume_from_checkpoint);
++        std::filesystem::path model_path = checkpoint_dir / "model.gguf";
++
++        LOG_INF("Loading checkpoint LoRA adapter: %s\n", model_path.c_str());
++        common_adapter_lora_info lora_adapter;
++        lora_adapter.path = model_path.string();
++        lora_adapter.scale = 1.0f;
++        lora_adapter.ptr = nullptr;
++        params.lora_adapters.clear(); // Remove any existing adapters
++        params.lora_adapters.push_back(lora_adapter);
++        LOG_INF("Checkpoint LoRA adapter added to params\n");
++    }
++
++    if (params.load_mode == LLAMA_LOAD_MODE_MMAP || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
++        LOG_INF("%s: force disabling memory mapping because it would result in-read-only pointers to the weights\n", __func__);
++        params.load_mode = params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK
++                                                                          : LLAMA_LOAD_MODE_NONE;
++    }
++    const bool supports_out_prod_f16 = training_supports_out_prod_f16(params);
++    if (!supports_out_prod_f16) {
++        if (params.cache_type_k != GGML_TYPE_F32) {
++            LOG_INF("%s: force changing k cache type to f32 due to a lack of f16 support for OUT_PROD\n", __func__);
++            params.cache_type_k = GGML_TYPE_F32;
++        }
++        if (params.cache_type_v != GGML_TYPE_F32) {
++            LOG_INF("%s: force changing v cache type to f32 due to a lack of f16 support for OUT_PROD\n", __func__);
++            params.cache_type_v = GGML_TYPE_F32;
++        }
++    }
++
++    common_init();
++    llama_backend_init();
++    llama_numa_init(params.numa);
++    params.training = true;
++
++    auto llama_init = common_init_from_params(params);
++    auto * model = llama_init->model();
++    auto * ctx   = llama_init->context();
++
++    if (model == NULL) {
++        LOG_ERR("%s: unable to load model\n", __func__);
++        return 1;
++    }
++
++    {
++        LOG_INF("\n");
++        LOG_INF("%s\n", common_params_get_system_info(params).c_str());
++    }
++
++    uint32_t target_modules = parse_lora_modules(ft_params.lora_modules_str);
++    if (target_modules == 0) {
++        return 1;
++    }
++
++    struct llama_lora_training_params lora_params = {
++        /*target_modules =*/ target_modules,
++        /*rank           =*/ ft_params.lora_rank,
++        /*alpha          =*/ ft_params.lora_alpha,
++        /*dropout        =*/ 0.0f,
++        /*init_std       =*/ 0.02f,
++        /*seed           =*/ ft_params.lora_seed,
++    };
++
++    bool has_existing_lora = !params.lora_adapters.empty();
++    struct llama_adapter_lora * trained_adapter = nullptr;
++
++    if (has_existing_lora) {
++        LOG_INF("Finetuning existing LoRA adapters\n");
++        LOG_INF("Found %zu existing LoRA adapters to train\n", params.lora_adapters.size());
++        trained_adapter = params.lora_adapters[0].ptr;
++        if (!trained_adapter) {
++            LOG_ERR("Existing LoRA adapter is null\n");
++            return 1;
++        }
++    } else {
++        LOG_INF("Target modules: Q=%s, K=%s, V=%s, O=%s, GATE=%s, UP=%s, DOWN=%s, OUTPUT=%s, "
++                "GATE_EXPS=%s, UP_EXPS=%s, DOWN_EXPS=%s, GATE_UP_EXPS=%s\n",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_Q) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_K) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_V) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_O) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_OUTPUT) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_EXPS) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP_EXPS) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN_EXPS) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS) ? "yes" : "no");
++
++        LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
++                lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
++
++        trained_adapter = llama_lora_training_init(ctx, model, &lora_params);
++        if (!trained_adapter) {
++            LOG_ERR("%s: LoRA training initialization failed\n", __func__);
++            return 1;
++        }
++    }
++
++    constexpr float val_split = 0.05f;
++
++    ggml_opt_dataset_t dataset;
++
++    if (ft_params.assistant_loss_only) {
++        LOG_INF("Using JSON dataset with chat template and assistant-only loss\n");
++        dataset = common_opt_sft_dataset_init(ctx, params.prompt, llama_n_ctx(ctx)/2, ft_params.chat_template_path);
++    } else {
++        std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
++        LOG_INF("Using standard next-token prediction mode\n");
++        dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx)/2);
++    }
++
++    if (dataset == nullptr) {
++        LOG_ERR("Failed to create dataset. Please check your input file and parameters.\n");
++        return 1;
++    }
++
++    const int64_t total_datapoints = ggml_opt_dataset_ndata(dataset);
++    const int64_t idata_split = static_cast<int64_t>(total_datapoints * (1.0f - val_split));
++    const int64_t training_batches_per_epoch = idata_split;
++
++    if (training_batches_per_epoch <= 0) {
++        LOG_ERR("Training split is empty. Adjust --val-split or dataset size.\n");
++        return 1;
++    }
++
++    lora_lr_scheduler_state lr_scheduler;
++    lr_scheduler.schedule = scheduler_type;
++    lr_scheduler.lr_init = ft_params.learning_rate;
++    lr_scheduler.lr_min = (scheduler_type == lora_lr_schedule_type::CONSTANT) ? ft_params.learning_rate : ft_params.lr_min;
++    lr_scheduler.weight_decay = ft_params.weight_decay;
++    lr_scheduler.total_steps = std::max<int64_t>(1, static_cast<int64_t>(ft_params.num_epochs) * training_batches_per_epoch);
++    if (ft_params.warmup_steps_set) {
++        lr_scheduler.warmup_steps = std::min<int64_t>(ft_params.warmup_steps, lr_scheduler.total_steps);
++    } else if (ft_params.warmup_ratio_set) {
++        const double warmup_from_ratio = static_cast<double>(lr_scheduler.total_steps) * static_cast<double>(ft_params.warmup_ratio);
++        lr_scheduler.warmup_steps = std::min<int64_t>(static_cast<int64_t>(warmup_from_ratio), lr_scheduler.total_steps);
++    } else {
++        lr_scheduler.warmup_steps = 0;
++    }
++    lr_scheduler.warmup_steps = std::max<int64_t>(lr_scheduler.warmup_steps, 0);
++    if (lr_scheduler.total_steps > 0) {
++        lr_scheduler.warmup_ratio = static_cast<float>(lr_scheduler.warmup_steps) / static_cast<float>(lr_scheduler.total_steps);
++    } else {
++        lr_scheduler.warmup_ratio = 0.0f;
++    }
++    lr_scheduler.current_step = 0;
++    lr_scheduler.last_lr = lora_scheduler_lr_for_step(lr_scheduler, lr_scheduler.current_step);
++
++    LOG_INF("Training split: datapoints=%lld, batches_per_epoch=%lld\n",
++        (long long) total_datapoints, (long long) training_batches_per_epoch);
++    LOG_INF("Optimizer: adamw scheduler=%s lr=%.4e wd=%.4e total_steps=%lld\n",
++            lora_lr_scheduler_type_to_cstr(lr_scheduler.schedule), lr_scheduler.lr_init,
++            lr_scheduler.weight_decay, (long long) lr_scheduler.total_steps);
++    if (lr_scheduler.schedule == lora_lr_schedule_type::COSINE) {
++        LOG_INF("Cosine scheduler: lr-min=%.4e\n", lr_scheduler.lr_min);
++    } else if (lr_scheduler.schedule == lora_lr_schedule_type::LINEAR) {
++        LOG_INF("Linear scheduler: lr-min=%.4e\n", lr_scheduler.lr_min);
++    }
++    if (lr_scheduler.warmup_steps > 0) {
++        LOG_INF("Warmup: steps=%lld ratio=%.4f\n", (long long) lr_scheduler.warmup_steps, lr_scheduler.warmup_ratio);
++    } else if (ft_params.warmup_ratio_set) {
++        LOG_WRN("Warmup ratio %.4f produced 0 warmup steps (total_steps=%lld); no warmup applied\n",
++            ft_params.warmup_ratio, (long long) lr_scheduler.total_steps);
++    }
++
++    int start_epoch = 0;
++    int64_t start_step = 0;
++    checkpoint_metadata checkpoint_meta = {};
++    bool checkpoint_loaded = false;
++
++    if (!ft_params.resume_from_checkpoint.empty()) {
++        if (validate_checkpoint_metadata(ft_params.resume_from_checkpoint, checkpoint_meta)) {
++            start_epoch = checkpoint_meta.epoch;
++            checkpoint_loaded = true;
++
++            if (checkpoint_meta.lora_rank != ft_params.lora_rank) {
++                LOG_ERR("Checkpoint LoRA rank (%d) doesn't match current rank (%d). Use --resume-from to manually specify a compatible checkpoint.\n",
++                        checkpoint_meta.lora_rank, ft_params.lora_rank);
++                return 1;
++            }
++            if (checkpoint_meta.lora_alpha != ft_params.lora_alpha) {
++                LOG_ERR("Checkpoint LoRA alpha (%.3f) doesn't match current alpha (%.3f)\n",
++                        checkpoint_meta.lora_alpha, ft_params.lora_alpha);
++                return 1;
++            }
++            if (checkpoint_meta.target_modules != target_modules) {
++                LOG_ERR("Checkpoint target_modules doesn't match current target_modules\n");
++                return 1;
++            }
++
++        } else {
++            LOG_ERR("Failed to load checkpoint, starting from scratch\n");
++        }
++    }
++
++    std::string optimizer_checkpoint_path;
++    if (checkpoint_loaded && !ft_params.resume_from_checkpoint.empty()) {
++        std::filesystem::path checkpoint_dir(ft_params.resume_from_checkpoint);
++        optimizer_checkpoint_path = (checkpoint_dir / "optimizer.gguf").string();
++    }
++
++    struct llama_opt_params lopt_params = llama_opt_default_params();
++    lopt_params.param_filter         = llama_opt_param_filter_lora;
++    lopt_params.get_opt_pars         = lora_scheduler_get_optimizer_params;
++    lopt_params.get_opt_pars_ud      = &lr_scheduler;
++    lopt_params.checkpoint_path      = checkpoint_loaded ? optimizer_checkpoint_path.c_str() : nullptr;
++    lopt_params.load_optimizer_state = checkpoint_loaded;
++    lopt_params.assistant_loss_only  = ft_params.assistant_loss_only;
++    lopt_params.flash_attn           = ft_params.train_flash_attn;
++    lopt_params.grad_clip            = ft_params.grad_clip;
++
++    llama_opt_init(ctx, model, lopt_params);
++
++    if (checkpoint_loaded) {
++        start_step = llama_opt_get_iter(ctx);
++    }
++
++    lr_scheduler.current_step = std::min<int64_t>(start_step, lr_scheduler.total_steps);
++    lr_scheduler.last_lr = lora_scheduler_lr_for_step(lr_scheduler, lr_scheduler.current_step);
++
++    if (!trained_adapter) {
++        LOG_ERR("No trained adapter available for checkpointing\n");
++        return 1;
++    }
++
++    if (start_step > 0) {
++        int64_t completed_epochs = start_step / training_batches_per_epoch;
++        start_epoch = (int)completed_epochs;
++        LOG_INF("Resuming training from global step %lld (lr=%.4e)\n",
++                (long long) start_step, lr_scheduler.last_lr);
++    }
++
++    checkpoint_callback_data cb_data = {
++        /*ctx                   =*/ ctx,
++        /*adapter               =*/ trained_adapter,
++        /*checkpoint_save_steps =*/ ft_params.checkpoint_save_steps,
++        /*checkpoint_save_dir   =*/ ft_params.checkpoint_save_dir,
++        /*global_step           =*/ start_step,
++        /*initial_step          =*/ start_step,
++        /*current_epoch         =*/ start_epoch,
++        /*lora_rank             =*/ ft_params.lora_rank,
++        /*lora_alpha            =*/ ft_params.lora_alpha,
++        /*target_modules        =*/ target_modules,
++        /*learning_rate         =*/ lr_scheduler.last_lr,
++        /*lr_scheduler          =*/ &lr_scheduler,
++        /*model_path            =*/ params.model.path,
++        /*dataset_path          =*/ params.prompt_file,
++    };
++    g_checkpoint_data = &cb_data;
++
++    ggml_opt_result_t result_train = ggml_opt_result_init();
++    ggml_opt_result_t result_eval  = ggml_opt_result_init();
++
++    for (int epoch = start_epoch; epoch < ft_params.num_epochs; ++epoch) {
++        if (cb_data.lr_scheduler) {
++            cb_data.learning_rate = lora_scheduler_lr_for_step(*cb_data.lr_scheduler, cb_data.lr_scheduler->current_step+1);
++        }
++        LOG_INF("Starting epoch %d (step %lld, lr=%.4e)\n", epoch, (long long)cb_data.global_step, cb_data.learning_rate);
++        cb_data.current_epoch = epoch;
++
++        int64_t resume_batch = 0;
++        if (start_step > 0 && epoch == start_epoch) {
++            resume_batch = start_step % training_batches_per_epoch;
++        }
++
++        ggml_opt_epoch_callback epoch_callback = (ft_params.checkpoint_save_steps <= 0) ?
++            ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
++
++        if (resume_batch > 0) {
++            LOG_INF("Resuming training from epoch %d, step %" PRId64 " \n", epoch, resume_batch);
++        } else if (ft_params.checkpoint_save_steps > 0) {
++            LOG_INF("Checkpointing enabled, saving every %d steps\n", ft_params.checkpoint_save_steps);
++        } else {
++            LOG_INF("Checkpointing disabled, using standard progress callback\n");
++        }
++
++        llama_opt_epoch_resume(ctx, dataset, result_train, result_eval, idata_split,
++            epoch_callback, epoch_callback, resume_batch);
++        fprintf(stderr, "\n");
++
++        ggml_opt_result_reset(result_train);
++        ggml_opt_result_reset(result_eval);
++    }
++
++    g_checkpoint_data = nullptr;
++    ggml_opt_result_free(result_train);
++    ggml_opt_result_free(result_eval);
++
++    std::string adapter_filename;
++    if (!ft_params.output_adapter_path.empty()) {
++        adapter_filename = ft_params.output_adapter_path;
++    } else if (has_existing_lora) {
++        adapter_filename = "finetuned-lora-adapter.gguf";
++        LOG_INF("Finetuned existing lora adapter, saving as: %s\n", adapter_filename.c_str());
++    } else {
++        adapter_filename = "trained-lora-adapter.gguf";
++        LOG_INF("Saving new lora adapter: %s\n", adapter_filename.c_str());
++    }
++
++    if (trained_adapter) {
++        if (llama_lora_save_adapter(trained_adapter, adapter_filename.c_str(), model)) {
++            std::ifstream adapter_file(adapter_filename, std::ios::binary | std::ios::ate);
++            if (adapter_file.is_open()) {
++                std::streamsize adapter_size = adapter_file.tellg();
++                LOG_INF("LoRA adapter saved: %s (%.2f MB)\n",
++                        adapter_filename.c_str(), adapter_size / (1024.0 * 1024.0));
++                adapter_file.close();
++            }
++        } else {
++            LOG_ERR("Failed to save LoRA adapter\n");
++        }
++    } else {
++        LOG_ERR("No trained adapter available for saving\n");
++    }
++
++    llama_backend_free();
++
++    return 0;
++}
+diff --git a/models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja b/models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja
+new file mode 100644
+index 000000000..c1510ac1d
+--- /dev/null
++++ b/models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja
+@@ -0,0 +1,111 @@
++{{- bos_token }}
++{%- if custom_tools is defined and custom_tools%}
++    {%- set tools = custom_tools %}
++{%- endif %}
++{%- if tools is defined and tools %}
++    {%- set tool_definition = (tool_definition|string) + ((tools | tojson(indent=4))|string) %}
++{%- else %}
++    {%- set tools = none %}
++{%- endif %}
++
++
++{#- This block extracts the system message, so we can slot it into the right place. #}
++{%- if messages[0]['role'] == 'system' %}
++    {%- set user_provided_system_message = true %}
++    {%- if messages[0]['content'] is string %}
++        {%- set system_message = messages[0]['content']|trim %}
++    {%- else %}
++        {%- set system_message = messages[0]['content'][0]['text']|trim %}
++    {%- endif %}
++    {%- set messages = messages[1:] %}
++{%- else %}
++    {%- if tools is not none  %}
++        {#- Since not system_message was provided by user, if tool is provided, system_message is now default tool system message #}
++        {#- This system message is from llama website:https://www.llama.com/docs/model-cards-and-prompt-formats/llama4/  #}
++        {%- set system_message = "You are a helpful assistant and an expert in function composition. You can answer general questions using your internal knowledge OR invoke functions when necessary. Follow these strict guidelines:\n\n1. FUNCTION CALLS:\n- ONLY use functions that are EXPLICITLY listed in the function list below\n- If NO functions are listed (empty function list []), respond ONLY with internal knowledge or \"I don't have access to [Unavailable service] information\"\n- If a function is not in the list, respond ONLY with internal knowledge or \"I don't have access to [Unavailable service] information\"\n- If ALL required parameters are present AND the query EXACTLY matches a listed function's purpose: output ONLY the function call(s)\n- Use exact format: [func_name1(param1=value1, param2=value2), func_name2(...)]\nExamples:\nCORRECT: [get_weather(location=\"Vancouver\"), calculate_route(start=\"Boston\", end=\"New York\")] <- Only if get_weather and calculate_route are in function list\nINCORRECT: get_weather(location=\"New York\")\nINCORRECT: Let me check the weather: [get_weather(location=\"New York\")]\nINCORRECT: [get_events(location=\"Singapore\")] <- If function not in list\n\n2. RESPONSE RULES:\n- For pure function requests matching a listed function: ONLY output the function call(s)\n- For knowledge questions: ONLY output text\n- For missing parameters: ONLY request the specific missing parameters\n- For unavailable services (not in function list): output ONLY with internal knowledge or \"I don't have access to [Unavailable service] information\". Do NOT execute a function call.\n- If the query asks for information beyond what a listed function provides: output ONLY with internal knowledge about your limitations\n- NEVER combine text and function calls in the same response\n- NEVER suggest alternative functions when the requested service is unavailable\n- NEVER create or invent new functions not listed below\n\n3. STRICT BOUNDARIES:\n- ONLY use functions from the list below - no exceptions\n- NEVER use a function as an alternative to unavailable information\n- NEVER call functions not present in the function list\n- NEVER add explanatory text to function calls\n- NEVER respond with empty brackets\n- Use proper Python/JSON syntax for function calls\n- Check the function list carefully before responding\n\n4. TOOL RESPONSE HANDLING:\n- When receiving tool responses: provide concise, natural language responses\n- Don't repeat tool response verbatim\n- Don't add supplementary information\n\nHere is a list of functions in JSON format that you can invoke:\n" %}
++    {%- else %}
++        {%- set system_message = "" %}
++    {%- endif %}
++{%- endif %}
++{#- Now writing the system message: use the user provided system message if user_provided_system_message, else default tool system message if tools presented #}
++{%- if system_message %}
++    {#- always use user provided system message to override default tool system message #}
++    {{- "<|header_start|>system<|header_end|>\n\n" }}
++    {{- system_message }}
++    {%- if user_provided_system_message and tools %}
++        {{- "\nHere is a list of functions in JSON format that you can invoke. Use exact format: [func_name1(param1=value1, param2=value2), func_name2(...)]\n" }}
++        {{- tool_definition -}}
++        {%- elif tool_definition %}
++        {{- tool_definition -}}
++    {%- endif %}
++    {{- "<|eot|>" }}
++{%- endif %}
++
++{#- Now deal with all other messages #}
++{%- for message in messages %}
++    {#- Base case: messages that are not from tool role and has empty tool_call list  #}
++    {%- if not (message.role == 'ipython' or message.role == 'tool' or ('tool_calls' in message and  message.tool_calls|length != 0 )) %}
++        {{- '<|header_start|>' + message['role'] + '<|header_end|>\n\n' }}
++        {%- if message['content'] is string %}
++            {{- message['content'] }}
++        {%- else %}
++            {%- for content in message['content'] %}
++                {%- if content['type'] == 'image' %}
++                    {{- '<|image|>' }}
++                {%- elif content['type'] == 'text' %}
++                    {{- content['text'] | trim }}
++                {%- endif %}
++            {%- endfor %}
++        {%- endif %}
++    {{- "<|eot|>" }}
++    {#- Tool case: messages has non-empty tool_call list, must from assistant #}
++    {%- elif 'tool_calls' in message %}
++        {#- assume tool_calls are always coming from assistant #}
++        {%- if message.role == 'assistant' %}
++            {{- '<|header_start|>assistant<|header_end|>\n\n' -}}
++        {%- if message['content'] is string %}
++            {{- message['content'] }}
++        {%- else %}
++            {%- for content in message['content'] %}
++                {%- if content['type'] == 'image' %}
++                    {{- '<|image|>' }}
++                {%- elif content['type'] == 'text' %}
++                    {{- content['text'] }}
++                {%- endif %}
++            {%- endfor %}
++        {%- endif %}
++            {{- "[" }}
++        {%- for tool_call in message.tool_calls %}
++            {%- if tool_call.function is defined %}
++                {%- set tool_call = tool_call.function %}
++            {%- endif %}
++                {{-  tool_call.name + '(' -}}
++            {%- for param in tool_call.arguments %}
++                {{- param + '="' -}}
++                {{- "%s" | format(tool_call.arguments[param]) -}}
++                {{- '"' -}}
++                {% if not loop.last %}, {% endif %}
++            {%- endfor %}
++            {{- ')' -}}
++            {% if not loop.last %}, {% endif %}
++        {%- endfor %}
++        {{- "]<|eot|>" }}
++{%- endif %}
++{#- Tool_response case: messages are from tool_response  #}
++    {%- elif message.role == "tool" or message.role == "ipython" %}
++        {{- "<|header_start|>ipython<|header_end|>\n\n" }}
++        {%- if message.content is string %}
++            {{-  message.content  | tojson }}
++        {%- else %}
++            {%- for content in message['content']  %}
++                {%- if content['type']  == 'text' %}
++                    {{-  content['text'] | tojson }}
++                {%- endif %}
++            {%- endfor %}
++        {%- endif %}
++        {{- "<|eot|>" }}
++    {%- endif %}
++{%- endfor %}
++{%- if add_generation_prompt %}
++    {{- '<|header_start|>assistant<|header_end|>\n\n' }}
++{%- endif %}
+\ No newline at end of file
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 36e48a0f2..b8033bd4b 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -383,16 +383,18 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")
+ if (APPLE)
+     llama_build(test-rset-release.cpp)
+     llama_build_and_test(test-host-buffer-release.cpp LINK ggml)
+ endif()
+ 
+ if (NOT GGML_BACKEND_DL AND GGML_CPU)
+     # these tests use the backends directly and cannot be built with dynamic loading
+     llama_build_and_test(test-barrier.cpp  LABEL "main behavior"  LINK ggml)
++    llama_build_and_test(test-turbo-quant.c  LABEL "main behavior"  LINK ggml)
++    target_include_directories(test-turbo-quant PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+     llama_build_and_test(test-quantize-fns.cpp  LABEL "main behavior"  LINK ggml)
+     llama_build_and_test(test-quantize-perf.cpp  LABEL "main behavior backend"  LINK ggml)
+     llama_build_and_test(test-rope.cpp  LABEL "main behavior backend"  LINK ggml)
+     llama_build_and_test(test-col2im-1d.cpp  LABEL "main behavior backend"  LINK ggml)
+     llama_build_and_test(test-conv-1d.cpp  LABEL "main behavior backend"  LINK ggml)
+     llama_build_and_test(test-gelu-quick.cpp  LABEL "main behavior backend"  LINK ggml)
+ endif()
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7abc117dd..8bc64c040 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2804,16 +2804,19 @@ struct test_set_rows : public test_case {
+                 init_set_rows_row_ids(t, ne[1]);
+             } else {
+                 init_tensor_uniform(t);
+             }
+         }
+     }
+ 
+     double max_nmse_err() override {
++        if (type_dst == GGML_TYPE_TURBO3_0 || type_dst == GGML_TYPE_TURBO4_0) {
++            return 5e-4;
++        }
+         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
+             type_dst == GGML_TYPE_IQ4_NL ||
+             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+             // estimate what the max nmse error would be if one quantized value is
+             // off by one. The test values are distributed in [-1,1], so it'll be
+             // roughly (2.0 / 2^bits)^2, divided by the mean square value of the reference,
+             // which is roughly 0.25 times the number of elements.
+             double err_estimate = 1.0f/8.0f;
+@@ -3947,16 +3950,54 @@ struct test_norm_mul_add : public test_case {
+ 
+         ggml_tensor * n = ggml_norm(ctx, a, eps);
+         ggml_tensor * m = ggml_mul(ctx, n, w);
+         ggml_tensor * out = ggml_add(ctx, m, b);
+         ggml_set_name(out, "out");
+         return out;
+     }
+ };
++// GGML_OP_SCALE + SILU/SIGMOID [+ GGML_OP_SCALE]
++struct test_scale_unary : public test_case {
++    const ggml_unary_op op;
++    const std::array<int64_t, 4> ne;
++    const float pre;
++    const float post; // 0: no trailing scale
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "SCALE_UNARY";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    std::string vars() override {
++        return VARS_TO_STR4(op, ne, pre, post);
++    }
++
++    test_scale_unary(ggml_unary_op op = GGML_UNARY_OP_SILU, std::array<int64_t, 4> ne = {128, 2, 1, 1},
++            float pre = 0.25f, float post = 0.0f)
++        : op(op), ne(ne), pre(pre), post(post) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_param(a); ggml_set_param(b);
++        ggml_set_name(a, "a"); ggml_set_name(b, "b");
++
++        ggml_tensor * x = ggml_add(ctx, a, b);
++        ggml_tensor * out = ggml_unary(ctx, ggml_scale(ctx, x, pre), op);
++        if (post != 0.0f) {
++            out = ggml_scale(ctx, out, post);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
+ struct test_norm_scale : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+     const float eps;
+     const bool rms;
+     const float scale;
+ 
+@@ -5195,26 +5236,27 @@ struct test_gated_delta_net : public test_case {
+     const int64_t head_count;
+     const int64_t head_size;
+     const int64_t n_seq_tokens;
+     const int64_t n_seqs;
+     const int     v_repeat;
+     const bool    permuted;
+     const bool    kda;
+     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
++    const bool    raw; // g and beta before their activations
+ 
+     std::string vars() override {
+-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
++        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, raw);
+     }
+ 
+     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
+             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
++            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, bool raw = false)
+         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
++          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), raw(raw) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q;
+         ggml_tensor * k;
+         ggml_tensor * v;
+         if (permuted) {
+             // create with dims 1 and 2 swapped, then permute back to get non-contiguous layout
+             q = ggml_permute(ctx, ggml_new_tensor_4d(ctx, type, head_size, n_seq_tokens, head_count, n_seqs), 0, 2, 1, 3);
+@@ -5234,26 +5276,45 @@ struct test_gated_delta_net : public test_case {
+         ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+         ggml_set_name(g,     "g");
+         ggml_set_name(beta,  "beta");
+         ggml_set_name(state, "state");
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
++        if (raw) {
++            ggml_tensor * dt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_count * v_repeat);
++            ggml_tensor * a  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_count * v_repeat);
++            ggml_set_name(dt, "dt");
++            ggml_set_name(a,  "a");
++            ggml_gated_delta_net_set_raw_gates(out, dt, a);
++        }
+         return out;
+     }
+ 
+     void initialize_tensors(ggml_context * ctx) override {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+             if (ggml_is_view_op(t->op)) { continue; }
+             if (strcmp(t->name, "g") == 0) {
+-                init_tensor_uniform(t, -20.0f, -1e-4f);
++                if (raw) {
++                    init_tensor_uniform(t, -4.0f, 4.0f);
++                } else {
++                    init_tensor_uniform(t, -20.0f, -1e-4f);
++                }
+             } else if (strcmp(t->name, "beta") == 0) {
+-                init_tensor_uniform(t, 0.0f, 1.0f);
++                if (raw) {
++                    init_tensor_uniform(t, -4.0f, 4.0f);
++                } else {
++                    init_tensor_uniform(t, 0.0f, 1.0f);
++                }
++            } else if (strcmp(t->name, "a") == 0) {
++                init_tensor_uniform(t, -2.0f, -0.1f);
++            } else if (strcmp(t->name, "dt") == 0) {
++                init_tensor_uniform(t, -1.0f, 1.0f);
+             } else if (strcmp(t->name, "v") == 0) {
+                 init_tensor_uniform(t, -0.3f, 5.0f);
+             } else {
+                 init_tensor_uniform(t);
+             }
+         }
+     }
+ };
+@@ -7305,16 +7366,64 @@ struct test_conv_3d : public test_case {
+ 
+         ggml_tensor * out = ggml_conv_3d_direct(ctx, kernel, input, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
+         ggml_set_name(out, "out");
+         return out;
+     }
+ };
+ 
+ // GGML_OP_CONCAT
++// a short state ahead of a transposed view along dim 0, as the recurrent models build their conv input
++struct test_concat_transposed : public test_case {
++    const std::array<int64_t, 3> ne_a; // {state, rows, seqs}
++    const int64_t n_t;
++
++    std::string vars() override {
++        return VARS_TO_STR2(ne_a, n_t);
++    }
++
++    test_concat_transposed(std::array<int64_t, 3> ne_a = {3, 100, 2}, int64_t n_t = 70)
++        : ne_a(ne_a), n_t(n_t) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[1], ne_a[2]);
++        ggml_set_name(a, "a");
++
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne_a[1], n_t, ne_a[2]);
++        ggml_set_name(b, "b");
++
++        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, b), 0);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
++// a strided view copied into a contiguous tensor of another shape, as a gate split from a joint projection
++struct test_cont_reshape : public test_case {
++    const std::array<int64_t, 3> ne; // {head, heads, tokens}
++
++    std::string vars() override {
++        return VARS_TO_STR1(ne);
++    }
++
++    test_cont_reshape(std::array<int64_t, 3> ne = {64, 4, 33}) : ne(ne) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * full = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2]);
++        ggml_set_name(full, "full");
++
++        ggml_tensor * half = ggml_view_3d(ctx, full, ne[0], ne[1], ne[2], full->nb[1], full->nb[2], ne[0]*ggml_element_size(full));
++        ggml_tensor * out = ggml_cont_2d(ctx, half, ne[0]*ne[1], ne[2]);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
+ struct test_concat : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+     const int64_t ne_b_d;
+     const int dim;
+     const int v; // view (1 << 0: non-cont a (first 3 dim), 1 << 1: non-cont b (first 3 dim), 1 << 2: non-cont a (last 2 dim), 1 << 3: non-cont b (last 2 dim), 1 << 4: transposed b)
+ 
+     std::string vars() override {
+@@ -10487,16 +10596,17 @@ struct test_falcon : public test_llm {
+ // ###########################################
+ static const ggml_type all_types[] = {
+     GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+     GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+     GGML_TYPE_Q8_0,
+     GGML_TYPE_Q1_0,
+     GGML_TYPE_Q2_0,
++    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
+     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+     GGML_TYPE_F8_E4M3,
+     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+     GGML_TYPE_Q6_K,
+     GGML_TYPE_TQ2_0,
+     GGML_TYPE_TQ1_0,
+     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+@@ -10518,16 +10628,17 @@ static const ggml_type base_types[] = {
+ };
+ 
+ static const ggml_type other_types[] = {
+     GGML_TYPE_Q4_1,
+     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+     GGML_TYPE_Q8_0,
+     GGML_TYPE_Q1_0,
+     GGML_TYPE_Q2_0,
++    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
+     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+     GGML_TYPE_Q5_K,
+     GGML_TYPE_Q6_K,
+     GGML_TYPE_TQ2_0,
+     GGML_TYPE_TQ1_0,
+     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+@@ -10760,16 +10871,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     for (bool v : {false, true}) {
+         test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_I32, 256, 5, 4, 1, v));
+     }
+ 
+     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
+     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
+     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
++    for (ggml_type type : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
++        for (int64_t head : {128, 256, 384, 512, 640}) {
++            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { head, 7, 1, 2 }, { 1, 1 }, 4, false));
++            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I32, { head, 7, 1, 2 }, { 1, 1 }, 4, true));
++        }
++    }
+     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (ggml_type type : all_types) {
+             for (int b : {1, 7}) {
+                 for (bool v : {false, true}) {
+                     test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 256, 5,  b, 3 }, { 1, 1, }, 1, v));
+                     test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 256, 11, 1, b }, { 2, 3, }, 7, v));
+ 
+                     test_cases.emplace_back(new test_set_rows(src_type, type, GGML_TYPE_I64, { 3*ggml_blck_size(type), 3, b, 1 }, { 2, 3, }, 2, v));
+@@ -11560,16 +11677,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
+             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+         }
+     }
++    for (ggml_unary_op u : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
++        for (float post : {0.0f, 2.0f}) {
++            test_cases.emplace_back(new test_scale_unary(u, {10240, 1, 1, 1}, 0.25f, post));
++            test_cases.emplace_back(new test_scale_unary(u, {4, 3, 1, 1}, 0.25f, post));
++            test_cases.emplace_back(new test_scale_unary(u, {320, 4, 1, 1}, -1.5f, post));
++        }
++    }
+     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
+         for (bool multi_add : {false, true}) {
+             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
+         }
+         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+     }
+     for (uint32_t n : {64, 1025}) {
+         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));
+@@ -11711,16 +11835,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 512, 256)); // many rows
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 1, 256));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 512, 1, 512));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 512, 256)); // many rows
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024));
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 85, 1024));
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 2048, 1, 2048));
++#ifdef GGML_USE_SYCL
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 1, 384));    // m=12 (N=384)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 32, 384));   // m=12 (batch)
++    test_cases.emplace_back(
++        new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 4, 384, { 2, 3 }));             // m=12 (multi-dim)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 768, 1, 768));   // m=12 (N=768)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 640, 1, 640));   // m=20 (N=640)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 640, 32, 640));  // m=20 (batch)
++    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1280, 1, 1280));  // m=20 (N=1280)
++#endif
+     test_cases.emplace_back(
+         new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 16384, 1, 16384));               // too big (N>8192)
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 1, 256));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 512, 1, 512));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 4, 128, {2, 3}));
+@@ -11843,16 +11980,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
+     // sides of that boundary, including an odd row count above it for the row-pair tail.
+     for (int64_t m : {6271, 6272, 6273}) {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
+     }
+ 
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
++    // q8_0 with three and four columns: few rows, a short row, and a large matrix
++    for (int64_t n : {3, 4}) {
++        for (auto mk : std::vector<std::array<int64_t, 2>>{{320, 2560}, {2560, 640}, {4096, 2560}, {8192, 512}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
++        }
++    }
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+ 
+     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
+     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
+     }
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 512, 2048, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 512, 2048, {1, 1}, {1, 1}));
+@@ -12049,16 +12192,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XS, GGML_TYPE_F16}) {
+         for (int n : {1, 15, 16, 17, 31, 32, 33, 47, 48, 49}) {
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 512, n, 256));
+         }
+         // experts that receive no rows at all
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
+     }
+ 
++    // experts two super-blocks deep, as in the down projection of small-expert MoEs
++    for (int n : {1, 2, 4, 8}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 8, false, 2048, n, 512));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 16, 8, false, 2052, n, 512));
++    }
++    // rows shorter than the blocks every simdgroup of the q8_0 mat-vec takes
++    for (int k : {256, 512, 768}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, 8, false, 1536, 1, k));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1536, 1, k, {1, 1}, {1, 1}));
++    }
++
+     for (ggml_type type_a : other_types) {
+         for (ggml_type type_b : {GGML_TYPE_F32}) {
+             if (ggml_blck_size(type_a) != 256) {
+                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, ggml_blck_size(type_a), {1,  1}, {1, 1}));
+             }
+             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {1,  1}, {1, 1}));
+         }
+     }
+@@ -12587,16 +12741,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+         for (int v : { 0, 4, 8, 12 }) {
+             for (int dim : { 0, 1, 2, 3, }) {
+                 test_cases.emplace_back(new test_concat(type_a, {128, 12, 13, 14}, dim == 0 ? 256 : 7, dim, v));
+             }
+         }
+     }
+ 
++    test_cases.emplace_back(new test_concat_transposed({3, 100, 2}, 70));
++    test_cases.emplace_back(new test_concat_transposed({3, 8192, 1}, 512));
++    test_cases.emplace_back(new test_concat_transposed({2, 64, 1}, 32));
++    test_cases.emplace_back(new test_concat_transposed({7, 33, 3}, 95));
++    test_cases.emplace_back(new test_cont_reshape({64, 4, 33}));
++    test_cases.emplace_back(new test_cont_reshape({256, 16, 512}));
++    test_cases.emplace_back(new test_cont_reshape({100, 3, 7}));
++
+     // few long rows, which backends may split across workgroups
+     for (int dim : { 0, 1 }) {
+         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));
+         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {20000, 3, 2, 1}, dim == 0 ? 333 : 1, dim, 1));
+         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
+     }
+ 
+     // GDN conv_input
+@@ -13044,16 +13206,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // sparse mask with large batch size
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
+     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
++    // Qwen3.8 Flash Next decode: head 256, twelve query heads per KV head, one token past the
++    // split-kernel threshold, below and above 4096 keys
++    for (int64_t kv : { 3328, 4352, 8448 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
++    }
+ 
+     // sparse attn (qwen4 shape - gqa 12)
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+ 
+     // sparse mask + quantized cache
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+@@ -13095,16 +13262,80 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    for (ggml_type type : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
++        for (int64_t head : {128, 384, 640}) {
++            for (int64_t batch : {1, 16}) {
++                test_cases.emplace_back(new test_flash_attn_ext(
++                    head, head, 4, {1, 1}, 113, batch, true, false,
++                    0.0f, 0.0f, GGML_PREC_F32, type, type));
++            }
++        }
++    }
++
++    // Turbo mixed with a standard type on the other side: the app offers q8_0 keys with
++    // turbo values, and q4_0 pairs were only added later, so cover both directions.
++    for (ggml_type turbo : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
++        for (ggml_type std_t : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++            for (int64_t head : {128, 384}) {
++                for (int64_t batch : {1, 16}) {
++                    test_cases.emplace_back(new test_flash_attn_ext(
++                        head, head, 4, {1, 1}, 113, batch, true, false,
++                        0.0f, 0.0f, GGML_PREC_F32, std_t, turbo));
++                    test_cases.emplace_back(new test_flash_attn_ext(
++                        head, head, 4, {1, 1}, 113, batch, true, false,
++                        0.0f, 0.0f, GGML_PREC_F32, turbo, std_t));
++                }
++            }
++        }
++    }
++
++    // Directed AMD wave32 coverage. kv=257 makes these cases easy to select as a
++    // compact suite and exercises decode vec, medium-batch tile, and large-batch PF.
++    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++        for (ggml_type type_V : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++            for (int64_t head : {64, 128, 256, 512}) {
++                for (int64_t batch : {1, 16, 32}) {
++                    test_cases.emplace_back(new test_flash_attn_ext(
++                        head, head, 4, {1, 1}, 257, batch, true, false,
++                        0.0f, 0.0f, GGML_PREC_F32, type_K, type_V));
++                }
++            }
++            // Long-cache single-token decode selects the split-WG path at dk256/512.
++            for (int64_t head : {256, 512}) {
++                test_cases.emplace_back(new test_flash_attn_ext(
++                    head, head, 4, {1, 1}, 1025, 1, true, false,
++                    0.0f, 0.0f, GGML_PREC_F32, type_K, type_V));
++            }
++        }
++    }
++    for (int64_t batch : {1, 16, 32}) {
++        test_cases.emplace_back(new test_flash_attn_ext(
++            72, 72, 4, {1, 1}, 257, batch, true, false,
++            0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    // Directed MLA coverage: asymmetric K=576/V=512 exercises AMD vec decode
++    // and the dedicated tile prefill kernel for both supported cache types.
++    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
++        for (int64_t batch : {1, 16, 32}) {
++            test_cases.emplace_back(new test_flash_attn_ext(
++                576, 512, 4, {1, 1}, 257, batch, true, false,
++                0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
++        }
++        // Long-cache decode exercises the 32-way cache split and reduction.
++        test_cases.emplace_back(new test_flash_attn_ext(
++            576, 512, 4, {1, 1}, 1025, 1, true, false,
++            0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
++    }
+ 
+     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
+ 
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 320, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+@@ -13160,17 +13391,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                 for (bool b : {false, true}) {
+                     if (!use_id && b) {
+                         continue;
+                     }
+                     for (bool with_bias : {false, true}) {
+                         if (!with_gate && !with_bias) {
+                             continue;
+                         }
+-                        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
++                        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_CLAMP, GGML_GLU_OP_SWIGLU_OAI}) {
+                             if (!with_bias && glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                                 continue;
+                             }
+                             if (!with_gate && glu_op != GGML_GLU_OP_SWIGLU) {
+                                 continue;
+                             }
+                             for (bool with_lane_scale : {false, true}) {
+                                 if (with_lane_scale && type != GGML_TYPE_NVFP4 && type != GGML_TYPE_F8_E4M3) {
+@@ -13325,16 +13556,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
+     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
+     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));
+     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1, 1, false, false, 1, true));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 2, 3, false, false, 1, true));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4, 1, 3, false, false, 1, true));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 1, false, false, 3, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index 2c59d1222..d65f6693b 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -1916,16 +1916,74 @@ static void test_convert_responses_to_chatcmpl() {
+         assert_equals(std::string("text"), msg2.at("content")[0].at("type").get<std::string>());
+         assert_equals(std::string("hi"), msg2.at("content")[0].at("text").get<std::string>());
+ 
+         // Verify other fields preserved
+         assert_equals(std::string("gpt-5-mini"), result.at("model").get<std::string>());
+         assert_equals(false, result.at("stream").get<bool>());
+     }
+ 
++    // Assistant items may omit 'type': clients that replay their own history
++    // rebuild the turn from stream deltas and only the completed item carries it
++    {
++        json input = json::parse(R"({
++            "input": [
++                {
++                    "role": "developer",
++                    "content": "developer1"
++                },
++                {
++                    "role": "assistant",
++                    "content": [
++                        {
++                            "type": "output_text",
++                            "text": "assistant1"
++                        }
++                    ]
++                },
++                {
++                    "role": "assistant",
++                    "content": "assistant2"
++                },
++                {
++                    "role": "user",
++                    "content": [
++                        {
++                            "type": "input_text",
++                            "text": "hello1"
++                        }
++                    ]
++                }
++            ],
++            "model": "test-model"
++        })");
++
++        json result = server_chat_convert_responses_to_chatcmpl(input);
++
++        assert_equals((size_t)3, result.at("messages").size());
++
++        const auto & dev_msg = result.at("messages")[0];
++        assert_equals(std::string("developer"), dev_msg.at("role").get<std::string>());
++        assert_equals(std::string("developer1"), dev_msg.at("content")[0].at("text").get<std::string>());
++
++        // the two assistant items merge into one message
++        const auto & asst_msg = result.at("messages")[1];
++        assert_equals(std::string("assistant"), asst_msg.at("role").get<std::string>());
++        assert_equals(false, asst_msg.contains("type"));
++        assert_equals((size_t)2, asst_msg.at("content").size());
++        assert_equals(std::string("text"), asst_msg.at("content")[0].at("type").get<std::string>());
++        assert_equals(std::string("assistant1"), asst_msg.at("content")[0].at("text").get<std::string>());
++        assert_equals(std::string("text"), asst_msg.at("content")[1].at("type").get<std::string>());
++        assert_equals(std::string("assistant2"), asst_msg.at("content")[1].at("text").get<std::string>());
++
++        const auto & user_msg = result.at("messages")[2];
++        assert_equals(std::string("user"), user_msg.at("role").get<std::string>());
++        assert_equals(std::string("hello1"), user_msg.at("content")[0].at("text").get<std::string>());
++    }
++
+     // Test string input
+     {
+         json input = json::parse(R"({
+             "input": "Hello, world!",
+             "model": "test-model"
+         })");
+ 
+         json result = server_chat_convert_responses_to_chatcmpl(input);
+@@ -2211,16 +2269,49 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
+     // Tool call with empty arguments
+     tst.test("<|tool_call_start|>[empty_args()]<|tool_call_end|>")
+         .tools({ empty_args_tool })
+         .expect(simple_assist_msg("", "", "empty_args", "{}"))
+         .run();
+ 
+ }
+ 
++// tool_choice "required" must end in a call: a short preamble is fine, a whole answer is not.
++static void test_required_tool_choice_grammar() {
++    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
++    for (bool thinking : { false, true })
++    for (auto format : { COMMON_REASONING_FORMAT_NONE, COMMON_REASONING_FORMAT_DEEPSEEK }) {
++        common_chat_templates_inputs inputs;
++        inputs.reasoning_format = format;
++        inputs.messages        = { message_user };
++        inputs.tools           = { run_in_terminal_tool };
++        inputs.tool_choice     = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++        inputs.enable_thinking = thinking;
++        auto params  = common_chat_templates_apply(tmpls.get(), inputs);
++        GGML_ASSERT(!params.grammar_lazy);
++        auto matches = [&](const std::string & text) {
++            auto grammar = build_grammar(params.grammar);
++            return match_string_detailed(text, grammar.get()).success;
++        };
++
++        const std::string head = params.generation_prompt + (thinking ? "Checking.\n</think>\n\n" : "");
++        const std::string call = "<tool_call>\n<function=run_in_terminal>\n<parameter=command>\npwd\n</parameter>\n</function>\n</tool_call>";
++        const std::string answer(400, 'a');
++
++        GGML_ASSERT(matches(head + call));
++        GGML_ASSERT(matches(head + "Let me check.\n" + call));
++        GGML_ASSERT(!matches(head + answer));
++        GGML_ASSERT(!matches(head + answer + call));
++        if (thinking) {
++            // the reasoning itself stays free, also when it is kept in the text
++            GGML_ASSERT(matches(params.generation_prompt + answer + "\n</think>\n\n" + call));
++        }
++    }
++}
++
+ static void test_template_output_peg_parsers(bool detailed_debug) {
+     LOG_DBG("%s\n", __func__);
+ 
+     // JSON schemas
+     const char * invoice_schema = R"({
+         "type": "object",
+         "properties": {
+             "amount": {"type": "number"},
+@@ -7553,16 +7644,109 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .messages({ message_user, message_assist_prefill_reasoning })
+             .add_generation_prompt(false)
+             .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+             .expect_reasoning("I'm thinking")
+             .expect_content("Hello, world!\nWhat's up?")
+             .run();
+     }
+ 
++    // Llama 4 - bare Python-style call list with no marker; the model also writes JSON calls and text before them
++    {
++        auto tst = peg_tester("models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja", detailed_debug);
++        tst.test("Hello, world!\nWhat's up?").expect(message_assist).run();
++        // with tools offered, text is still the answer
++        tst.test("Hello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).run();
++        // an empty list is no call, and what follows it on a new line is the answer
++        tst.test("[]").tools({ special_function_tool }).expect(simple_assist_msg("")).run();
++        tst.test("[]\n\nHello, world!\nWhat's up?").tools({ special_function_tool }).expect(message_assist).run();
++        tst.test("[Wikipedia](https://www.wikipedia.org) has it.")
++            .tools({ get_time_tool })
++            .expect(simple_assist_msg("[Wikipedia](https://www.wikipedia.org) has it."))
++            .run();
++        tst.test("[special_function(arg1=1)]").tools({ special_function_tool }).expect(message_assist_call).run();
++        tst.test("[get_time(city=\"Paris\")]")
++            .tools({ get_time_tool })
++            .expect(message_with_tool_calls("get_time", "{\"city\":\"Paris\"}"))
++            .run();
++        tst.test("[special_function(arg1=1), get_time(city=\"Paris\")]")
++            .tools({ special_function_tool, get_time_tool })
++            .parallel_tool_calls(true)
++            .expect_tool_calls({
++                { "special_function", R"({"arg1": 1})", {} },
++                { "get_time", R"({"city": "Paris"})", {} },
++            })
++            .run();
++        tst.test("Hello, world!\nWhat's up?\n\n[special_function(arg1=1)]")
++            .tools({ special_function_tool })
++            .expect(simple_assist_msg("Hello, world!\nWhat's up?\n\n", "", "special_function", R"({"arg1": 1})"))
++            .run();
++        tst.test(R"({"type": "function", "name": "special_function", "parameters": {"arg1": 1}})")
++            .tools({ special_function_tool })
++            .expect(message_assist_call)
++            .run();
++        tst.test(R"([{"name": "special_function", "parameters": {"arg1": 1}}])")
++            .tools({ special_function_tool })
++            .expect(message_assist_call)
++            .run();
++        tst.test(R"({"name": "special_function", "parameters": {"arg1": 1}}; {"name": "get_time", "parameters": {"city": "Paris"}})")
++            .tools({ special_function_tool, get_time_tool })
++            .parallel_tool_calls(true)
++            .expect_tool_calls({
++                { "special_function", R"({"arg1": 1})", {} },
++                { "get_time", R"({"city": "Paris"})", {} },
++            })
++            .run();
++        tst.test("Let me check.\n\n" R"({"type": "function", "name": "get_time", "parameters": {"city": "Paris"}})")
++            .tools({ get_time_tool })
++            .expect(simple_assist_msg("Let me check.\n\n", "", "get_time", R"({"city": "Paris"})"))
++            .run();
++        // a JSON object that is not a call stays text
++        tst.test(R"(Use {"name": "Ana", "age": 3} as the input.)")
++            .tools({ get_time_tool })
++            .expect(simple_assist_msg(R"(Use {"name": "Ana", "age": 3} as the input.)"))
++            .run();
++        tst.test("[special_function(arg1=1)]")
++            .tools({ special_function_tool })
++            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
++            .expect(message_assist_call)
++            .run();
++
++        // a call in the history renders, though the template iterates a content it may not get
++        common_chat_msg tool_result;
++        tool_result.role         = "tool";
++        tool_result.content      = "Sunny";
++        tool_result.tool_call_id = "call0";
++        tst.test("It is sunny.")
++            .tools({ special_function_tool })
++            .messages({ message_user, message_assist_call, tool_result })
++            .expect(simple_assist_msg("It is sunny."))
++            .run();
++
++        // a system message of the chat's own gets the answer rules the template keeps only for its default one
++        auto tmpls = read_templates("models/templates/unsloth-Llama-4-Scout-17B-16E-Instruct.jinja");
++        common_chat_msg system_msg;
++        system_msg.role    = "system";
++        system_msg.content = "You are a helpful assistant.";
++        common_chat_templates_inputs inputs;
++        inputs.messages              = { system_msg, message_user };
++        inputs.tools                 = { special_function_tool };
++        inputs.add_generation_prompt = true;
++        auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
++        auto rules  = prompt.find("NEVER respond with empty brackets");
++        if (prompt.find("You are a helpful assistant.") == std::string::npos || rules == std::string::npos ||
++            rules > prompt.find("Here is a list of functions")) {
++            throw std::runtime_error("Llama 4: the answer rules are missing from a system message of the chat's own");
++        }
++        inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
++        if (common_chat_templates_apply(tmpls.get(), inputs).prompt.find("NEVER respond with empty brackets") != std::string::npos) {
++            throw std::runtime_error("Llama 4: the answer rules were added with tools turned off");
++        }
++    }
++
+     // GigaChat V3
+     {
+         auto tst = peg_tester("models/templates/GigaChat3-10B-A1.8B.jinja", detailed_debug);
+         tst.test("Hello, world!\nWhat's up?").expect(message_assist).expect_reconstruction().run();
+         tst.test("<|message_sep|>\n\nfunction call<|role_sep|>\n{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}")
+             .tools({ special_function_tool })
+             .expect(message_assist_call)
+             .expect_reconstruction()
+@@ -8695,12 +8879,13 @@ int main(int argc, char ** argv) {
+         test_template_generation_prompt();
+         test_reasoning_effort_caps();
+         test_prompt_parts();
+         test_chat_session();
+         test_chat_json_depth();
+         test_reasoning_budget_tokens_per_request();
+         test_reasoning_budget_message_per_request();
+         test_template_output_peg_parsers(detailed_debug);
++        test_required_tool_choice_grammar();
+         std::cout << "\n[chat] All tests passed!" << '\n';
+     }
+     return 0;
+ }
+diff --git a/tests/test-quantize-fns.cpp b/tests/test-quantize-fns.cpp
+index bdc04c734..4739c937c 100644
+--- a/tests/test-quantize-fns.cpp
++++ b/tests/test-quantize-fns.cpp
+@@ -327,46 +327,55 @@ static int test_vec_dot_q(bool verbose) {
+             continue;
+         }
+ 
+         const ggml_type ei = (ggml_type)i;
+ 
+         printf("Testing %s\n", ggml_type_name((ggml_type) i));
+         ggml_quantize_init(ei);
+ 
++        // Turbo KV dequantizes into the WHT-rotated attention domain. The
++        // generic roundtrip and dot-product checks below compare against the
++        // unrotated input, so their metric is not defined for these types.
++        // test-turbo-quant performs the corresponding inverse-WHT checks.
++        if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
++            continue;
++        }
++
+         if (qfns_cpu->from_float && qfns->to_float) {
+             const float total_error = total_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
+             const float max_quantization_error =
+                 type == GGML_TYPE_Q1_0    ? MAX_QUANTIZATION_TOTAL_ERROR_BINARY :
+                 type == GGML_TYPE_TQ1_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                 type == GGML_TYPE_TQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                 type == GGML_TYPE_Q2_0    ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                 type == GGML_TYPE_PQ2_0   ? MAX_QUANTIZATION_TOTAL_ERROR_TERNARY :
+                 type == GGML_TYPE_Q2_K    ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                 type == GGML_TYPE_IQ2_S   ? MAX_QUANTIZATION_TOTAL_ERROR_2BITS :
+                 type == GGML_TYPE_Q3_K    ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                 type == GGML_TYPE_IQ3_S   ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
++                type == GGML_TYPE_TQ3_1S  ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS :
+                 type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 : MAX_QUANTIZATION_TOTAL_ERROR;
+             bool failed = !(total_error < max_quantization_error);
+             num_failed += failed;
+             if (failed || verbose) {
+                 printf("%5s absolute quantization error:    %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], total_error);
+             }
+ 
+             const float reference_error = reference_quantization_error(qfns, qfns_cpu, test_size, test_data.data());
+             failed = !(reference_error < MAX_QUANTIZATION_REFERENCE_ERROR);
+             num_failed += failed;
+             if (failed || verbose) {
+                 printf("%5s reference implementation error: %s (%f)\n", ggml_type_name(type), RESULT_STR[failed], reference_error);
+             }
+ 
+             const float vec_dot_error = dot_product_error(qfns_cpu, type, test_size, test_data.data(), test_data2.data(), nullptr, nullptr, 1);
+             const float max_allowed_error = type == GGML_TYPE_Q2_K || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS ||
+-                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S
++                type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_TQ3_1S
+                 ? MAX_DOT_PRODUCT_ERROR_LOWBIT
+                 : type == GGML_TYPE_Q1_0
+                 ? MAX_DOT_PRODUCT_ERROR_BINARY
+                 : type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0
+                 ? MAX_DOT_PRODUCT_ERROR_TERNARY
+                 : type == GGML_TYPE_NVFP4
+                 ? MAX_DOT_PRODUCT_ERROR_FP4
+                 : MAX_DOT_PRODUCT_ERROR;
+diff --git a/tests/test-reasoning-budget.cpp b/tests/test-reasoning-budget.cpp
+index a50a10824..75c9ff3b5 100644
+--- a/tests/test-reasoning-budget.cpp
++++ b/tests/test-reasoning-budget.cpp
+@@ -183,16 +183,63 @@ static void test_reasoning_budget_clone_mid_forcing() {
+     auto * clone = llama_sampler_clone(sampler);
+ 
+     GGML_ASSERT(get_forced_token(clone, 102) == 101 && "cloned forcing state lost force position");
+ 
+     llama_sampler_free(clone);
+     llama_sampler_free(sampler);
+ }
+ 
++static void test_reasoning_budget_prompt_tokens() {
++    const std::vector<llama_token> start  = {100};
++    const std::vector<llama_token> end    = {101};
++    const std::vector<llama_token> forced = {101};
++
++    // the prompt leaves the block open with a token after the start tag: the end is still forced
++    {
++        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
++
++        common_reasoning_budget_accept_prompt(sampler, 100);
++        common_reasoning_budget_accept_prompt(sampler, 50);
++
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
++        GGML_ASSERT(get_forced_token(sampler, 101) == 101 && "a prompt token used up the forced end tag");
++
++        llama_sampler_accept(sampler, 101);
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
++
++        llama_sampler_free(sampler);
++    }
++
++    // the prompt already closes the block: nothing is left to force
++    {
++        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
++
++        for (llama_token token : {100, 50, 101, 50}) {
++            common_reasoning_budget_accept_prompt(sampler, token);
++        }
++
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
++
++        llama_sampler_free(sampler);
++    }
++
++    // with budget left the prompt counts like generated text
++    {
++        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
++
++        common_reasoning_budget_accept_prompt(sampler, 100);
++        common_reasoning_budget_accept_prompt(sampler, 50);
++
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
++
++        llama_sampler_free(sampler);
++    }
++}
++
+ static void test_reasoning_budget_force_manual() {
+     const std::vector<llama_token> start  = {100};
+     const std::vector<llama_token> end    = {101};
+     const std::vector<llama_token> forced = {102, 101};
+ 
+     // if COUNTING, force() succeeds and begins forcing the end sequence from the start
+     {
+         auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 5, REASONING_BUDGET_IDLE);
+@@ -504,16 +551,17 @@ int main(void) {
+         test_reasoning_budget("multiple end sequences", sequence, start, end, forced,
+             5,      // budget of 5 tokens
+             REASONING_BUDGET_IDLE,
+             SIZE_MAX, SIZE_MAX); // no forcing expected (natural end)
+     }
+ 
+     test_reasoning_budget_clone_mid_counting();
+     test_reasoning_budget_clone_mid_forcing();
++    test_reasoning_budget_prompt_tokens();
+     test_reasoning_budget_force_manual();
+     test_reasoning_budget_end_match();
+ 
+     printf("OK (12 tests passed)\n");
+ 
+     printf("Testing UTF-8 boundary detection... ");
+     test_utf8_boundary_detection();
+     printf("OK\n");
+diff --git a/tests/test-turbo-quant.c b/tests/test-turbo-quant.c
+new file mode 100644
+index 000000000..789bdfb6d
+--- /dev/null
++++ b/tests/test-turbo-quant.c
+@@ -0,0 +1,125 @@
++#include "ggml-quants.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern void turbo_cpu_fwht_inverse(float * x, int group_size);
++
++static uint32_t rng_state = 0x12345678u;
++
++static float next_value(void) {
++    rng_state = rng_state*1664525u + 1013904223u;
++    return ((float) (rng_state >> 8)/(float) 0x00ffffffu)*2.0f - 1.0f;
++}
++
++static void inverse_groups(float * values, int n) {
++    for (int i = 0; i < n; i += 128) {
++        turbo_cpu_fwht_inverse(values + i, 128);
++    }
++}
++
++static float cosine(const float * a, const float * b, int n) {
++    double dot = 0.0;
++    double na = 0.0;
++    double nb = 0.0;
++    for (int i = 0; i < n; ++i) {
++        dot += (double) a[i]*b[i];
++        na += (double) a[i]*a[i];
++        nb += (double) b[i]*b[i];
++    }
++    return na > 0.0 && nb > 0.0 ? (float) (dot/sqrt(na*nb)) : 1.0f;
++}
++
++static float relative_norm_error(const float * a, const float * b, int n) {
++    double na = 0.0;
++    double nb = 0.0;
++    for (int i = 0; i < n; ++i) {
++        na += (double) a[i]*a[i];
++        nb += (double) b[i]*b[i];
++    }
++    return na > 0.0 ? (float) fabs(sqrt(nb/na) - 1.0) : (float) sqrt(nb);
++}
++
++static void fill_values(float * values, int n, int pattern) {
++    for (int i = 0; i < n; ++i) {
++        switch (pattern) {
++            case 0: values[i] = 0.0f; break;
++            case 1: values[i] = sinf((float) i*0.071f)*10.0f; break;
++            case 2: values[i] = next_value(); break;
++            default: values[i] = (i % 29 == 0) ? 25.0f : next_value()*0.05f; break;
++        }
++    }
++}
++
++static int test_turbo3(int n, int pattern) {
++    const size_t bytes = (size_t) (n/QK_TURBO3)*sizeof(block_turbo3_0);
++    float * input = (float *) malloc((size_t) n*sizeof(float));
++    float * output = (float *) malloc((size_t) n*sizeof(float));
++    block_turbo3_0 * q0 = (block_turbo3_0 *) calloc(1, bytes);
++    block_turbo3_0 * q1 = (block_turbo3_0 *) calloc(1, bytes);
++    if (!input || !output || !q0 || !q1) return 1;
++
++    fill_values(input, n, pattern);
++    quantize_row_turbo3_0_ref(input, q0, n);
++    quantize_row_turbo3_0_ref(input, q1, n);
++    dequantize_row_turbo3_0(q0, output, n);
++    inverse_groups(output, n);
++
++    const float cos = cosine(input, output, n);
++    const float norm_err = relative_norm_error(input, output, n);
++    const int failed = memcmp(q0, q1, bytes) != 0 || cos < 0.90f || norm_err > 0.002f;
++    if (failed) fprintf(stderr, "turbo3 n=%d pattern=%d cosine=%g norm_err=%g\n", n, pattern, cos, norm_err);
++
++    free(q1);
++    free(q0);
++    free(output);
++    free(input);
++    return failed;
++}
++
++static int test_turbo4(int n, int pattern) {
++    const size_t bytes = (size_t) (n/QK_TURBO4)*sizeof(block_turbo4_0);
++    float * input = (float *) malloc((size_t) n*sizeof(float));
++    float * output = (float *) malloc((size_t) n*sizeof(float));
++    block_turbo4_0 * q0 = (block_turbo4_0 *) calloc(1, bytes);
++    block_turbo4_0 * q1 = (block_turbo4_0 *) calloc(1, bytes);
++    if (!input || !output || !q0 || !q1) return 1;
++
++    fill_values(input, n, pattern);
++    quantize_row_turbo4_0_ref(input, q0, n);
++    quantize_row_turbo4_0_ref(input, q1, n);
++    dequantize_row_turbo4_0(q0, output, n);
++    inverse_groups(output, n);
++
++    const float cos = cosine(input, output, n);
++    const float norm_err = relative_norm_error(input, output, n);
++    const int failed = memcmp(q0, q1, bytes) != 0 || cos < 0.97f || norm_err > 0.002f;
++    if (failed) fprintf(stderr, "turbo4 n=%d pattern=%d cosine=%g norm_err=%g\n", n, pattern, cos, norm_err);
++
++    free(q1);
++    free(q0);
++    free(output);
++    free(input);
++    return failed;
++}
++
++int main(void) {
++    int failed = 0;
++    const int dimensions[] = {128, 256, 384, 512, 640};
++    for (size_t i = 0; i < sizeof(dimensions)/sizeof(dimensions[0]); ++i) {
++        const int n = dimensions[i];
++        for (int pattern = 0; pattern < 4; ++pattern) {
++            failed += test_turbo3(n, pattern);
++            failed += test_turbo4(n, pattern);
++        }
++    }
++    if (failed) {
++        fprintf(stderr, "%d TurboQuant checks failed\n", failed);
++        return 1;
++    }
++    printf("TurboQuant CPU suite passed\n");
++    return 0;
++}
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index a555e75dd..489b9a9a0 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -516,16 +516,25 @@ static ggml_type ggml_type_from_name(const std::string & s) {
+         return GGML_TYPE_Q5_0;
+     }
+     if (s == "q5_1") {
+         return GGML_TYPE_Q5_1;
+     }
+     if (s == "iq4_nl") {
+         return GGML_TYPE_IQ4_NL;
+     }
++    if (s == "turbo2") {
++        return GGML_TYPE_TURBO2_0;
++    }
++    if (s == "turbo3") {
++        return GGML_TYPE_TURBO3_0;
++    }
++    if (s == "turbo4") {
++        return GGML_TYPE_TURBO4_0;
++    }
+ 
+     return GGML_TYPE_COUNT;
+ }
+ 
+ static cmd_params parse_cmd_params(int argc, char ** argv) {
+     cmd_params        params;
+     std::string       arg;
+     bool              invalid_param = false;
+@@ -2114,17 +2123,19 @@ struct markdown_printer : public printer {
+                 width += 1;
+             }
+             fprintf(fout, " %*s |", width, value.c_str());
+         }
+         fprintf(fout, "\n");
+     }
+ 
+     void print_footer() override {
+-        fprintf(fout, "\nbuild: %s (%d)\n", test::build_commit.c_str(), test::build_number);
++        // the build number only tracks upstream, so name the engine version too
++        fprintf(fout, "\nbuild: %s (%d), ToshLLM engine %s\n", test::build_commit.c_str(), test::build_number,
++                common_tosh_version());
+     }
+ };
+ 
+ struct sql_printer : public printer {
+     static std::string get_sql_field_type(const std::string & field) {
+         switch (test::get_field_type(field)) {
+             case test::STRING:
+                 return "TEXT";
+diff --git a/tools/mtmd/mtmd-model.h b/tools/mtmd/mtmd-model.h
+index 0d975ba36..962bb9beb 100644
+--- a/tools/mtmd/mtmd-model.h
++++ b/tools/mtmd/mtmd-model.h
+@@ -262,22 +262,25 @@ struct mtmd_hparams {
+             image_min_pixels = custom_image_min_tokens * patch_area;
+         }
+         if (custom_image_max_tokens > 0) {
+             image_max_pixels = custom_image_max_tokens * patch_area;
+         }
+     }
+ 
+     void set_warmup_n_tokens(int n_tokens) {
+-        int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
+-        GGML_ASSERT(n_tok_per_side * n_tok_per_side == n_tokens && "n_tokens must be n*n");
+-        // do not warmup with more tokens than the max allowed
+-        if (custom_image_max_tokens > 0 && n_tokens > custom_image_max_tokens) {
+-            n_tok_per_side = std::max(1, static_cast<int>(std::sqrt(custom_image_max_tokens)));
++        // the cap has to shrink the warmup too: without flash attention this graph holds the
++        // whole score matrix, and on a small card it is the warmup that fails to allocate
++        const bool capped = custom_image_max_tokens > 0 && custom_image_max_tokens < n_tokens;
++        if (capped) {
++            n_tokens = custom_image_max_tokens;
+         }
++        int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
++        GGML_ASSERT(n_tok_per_side > 0);
++        GGML_ASSERT((capped || n_tok_per_side * n_tok_per_side == n_tokens) && "n_tokens must be n*n");
+         warmup_image_size = n_tok_per_side * patch_size * n_merge;
+     }
+     // sam vit deepseek-ocr
+     std::vector<int32_t> global_attn_indices() const {
+         return {  2,  5,  8, 11 };
+     }
+     bool is_global_attn(int32_t layer) const {
+         const auto indices = global_attn_indices();
+diff --git a/tosh-moe/tosh-dmoe.cpp b/tosh-moe/tosh-dmoe.cpp
+new file mode 100644
+index 000000000..f1b201aeb
+--- /dev/null
++++ b/tosh-moe/tosh-dmoe.cpp
+@@ -0,0 +1,446 @@
++#include "tosh-dmoe.h"
++
++#include <atomic>
++#include <vector>
++#include <cstdio>
++#include <cstdlib>
++#include <chrono>
++#include <condition_variable>
++#include <algorithm>
++#include <mutex>
++#include <thread>
++
++namespace {
++
++std::atomic<char *>   g_stage{nullptr};
++std::atomic<size_t>   g_stride{0};
++
++void *                g_ev = nullptr;
++uint64_t            (*g_ev_get)(void *) = nullptr;
++void                (*g_ev_set)(void *, uint64_t) = nullptr;
++
++std::atomic<uint64_t> g_value{1};
++
++tosh_dmoe_job         g_jobs[TOSH_DMOE_RING];
++
++std::mutex              g_active_mutex;
++std::condition_variable g_active_cv;
++std::atomic<bool>       g_active{false};
++
++std::atomic<const char *> g_failed{nullptr};
++
++int32_t *            g_tables = nullptr;
++size_t               g_tables_bytes = 0;
++int                  g_tables_layers = 0;
++int                  g_tables_experts = 0;
++std::atomic<int>     g_version{0};
++
++std::atomic<uint64_t> g_tick{0};
++std::atomic<uint64_t> g_completed{0};
++std::mutex              g_done_mutex;
++std::condition_variable g_done_cv;
++
++tosh_dmoe_uploader    g_uploader = {};
++std::atomic<bool>     g_has_uploader{false};
++
++std::atomic<tosh_dmoe_bank_plan_fn> g_planner{nullptr};
++
++void *                g_obs_ring = nullptr;
++tosh_dmoe_obs_record  g_obs[TOSH_DMOE_OBS_RECORDS];
++std::atomic<uint64_t> g_obs_seq{0};
++uint32_t              g_obs_off = 0;
++std::atomic<uint64_t> g_obs_pos{0};
++std::mutex            g_obs_mutex;
++
++}
++
++static std::atomic<bool> g_forced{false};
++void tosh_dmoe_enable(void) { g_forced.store(true); }
++
++bool tosh_dmoe_enabled(void) {
++    static const bool on = getenv("TOSH_DMOE_RESIDENCY") != nullptr || getenv("TOSH_DMOE_CACHE_MIB") != nullptr;
++    return on || g_forced.load(std::memory_order_relaxed);
++}
++
++void tosh_dmoe_set_stage(void * host, size_t layer_stride) {
++    g_stride.store(layer_stride);
++    g_stage.store((char *) host);
++}
++
++void * tosh_dmoe_stage_layer(int il) {
++    char * s = g_stage.load();
++    return s ? s + (size_t) il*g_stride.load() : nullptr;
++}
++
++void tosh_dmoe_set_event(void * ev, uint64_t (*get)(void *), void (*set)(void *, uint64_t)) {
++    g_ev_get = get;
++    g_ev_set = set;
++    g_ev     = ev;
++}
++
++uint64_t tosh_dmoe_event_get(void) {
++    return g_ev ? g_ev_get(g_ev) : 0;
++}
++
++void tosh_dmoe_event_set(uint64_t value) {
++    if (g_ev) {
++        g_ev_set(g_ev, value);
++    }
++}
++
++uint64_t tosh_dmoe_next_value(void) { return g_value.fetch_add(2); }
++uint64_t tosh_dmoe_last_value(void) { return g_value.load() - 2; }
++
++void tosh_dmoe_set_tables(int32_t * host, size_t bytes, int n_layers, int n_expert) {
++    g_tables_bytes   = bytes;
++    g_tables_layers  = n_layers;
++    g_tables_experts = n_expert;
++    g_tables         = host;
++}
++
++int32_t * tosh_dmoe_tables(size_t * bytes, int * n_layers, int * n_expert) {
++    if (bytes)    *bytes    = g_tables_bytes;
++    if (n_layers) *n_layers = g_tables_layers;
++    if (n_expert) *n_expert = g_tables_experts;
++    return g_tables;
++}
++
++void tosh_dmoe_publish_version(int version) { g_version.store(version, std::memory_order_release); }
++int  tosh_dmoe_published_version(void)      { return g_version.load(std::memory_order_acquire); }
++
++uint64_t tosh_dmoe_tick_next(void) { return g_tick.fetch_add(1) + 1; }
++static std::atomic<bool> g_wide{false};
++void tosh_dmoe_note_wide(bool wide) { g_wide.store(wide); }
++bool tosh_dmoe_wide(void)           { return g_wide.load(); }
++uint64_t tosh_dmoe_tick(void)      { return g_tick.load(); }
++
++static void * g_wide_stage = nullptr;
++static size_t g_wide_bytes = 0;
++void tosh_dmoe_set_wide_stage(void * host, size_t bytes) { g_wide_stage = host; g_wide_bytes = bytes; }
++void * tosh_dmoe_wide_stage(size_t * bytes) {
++    if (bytes) *bytes = g_wide_bytes;
++    return g_wide_stage;
++}
++
++namespace {
++struct tl_event { int kind, il; double t0, t1; };
++std::mutex g_tl_mutex;
++std::vector<tl_event> g_tl;
++void tl_dump() {
++    const char * p = getenv("TOSH_DMOE_TIMELINE");
++    if (!p) return;
++    std::lock_guard<std::mutex> lock(g_tl_mutex);
++    if (FILE * f = fopen(p, "w")) {
++        for (auto & e : g_tl) fprintf(f, "%d %d %.6f %.6f\n", e.kind, e.il, e.t0, e.t1);
++        fclose(f);
++    }
++}
++}
++// steady_clock runs on the same uptime clock Metal stamps command buffers with
++double tosh_dmoe_host_seconds(void) {
++    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++void tosh_dmoe_timeline(int kind, int il, double t0, double t1) {
++    static const bool on = getenv("TOSH_DMOE_TIMELINE") != nullptr;
++    if (!on) return;
++    std::lock_guard<std::mutex> lock(g_tl_mutex);
++    if (g_tl.empty()) { g_tl.reserve(1 << 20); atexit(tl_dump); }
++    if (g_tl.size() < (1 << 22)) g_tl.push_back({ kind, il, t0, t1 });
++}
++
++static size_t g_vram_free = 0, g_vram_total = 0;
++void tosh_dmoe_set_vram(size_t free_at_start, size_t total) {
++    if (g_vram_total == 0) { g_vram_free = free_at_start; g_vram_total = total; }
++}
++static size_t (*g_private_query)(void) = nullptr;
++void   tosh_dmoe_set_private_query(size_t (*fn)(void)) { g_private_query = fn; }
++size_t tosh_dmoe_private_bytes(void) { return g_private_query ? g_private_query() : 0; }
++
++bool tosh_dmoe_vram(size_t * free_at_start, size_t * total) {
++    *free_at_start = g_vram_free; *total = g_vram_total;
++    return g_vram_total > 0;
++}
++
++static bool (*g_vram_query)(int64_t *, int64_t *) = nullptr;
++void tosh_dmoe_set_vram_query(bool (*fn)(int64_t *, int64_t *)) { g_vram_query = fn; }
++
++bool tosh_vram_read(size_t * vfree, size_t * total) {
++    if (g_vram_query == nullptr) {
++        return false;
++    }
++    constexpr int N = 3;
++    int64_t f[N], u[N];
++    int n = 0;
++    for (int i = 0; i < N; ++i) {
++        if (i > 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
++        if (g_vram_query(&f[n], &u[n]) && f[n] >= 0 && u[n] >= 0) n++;
++    }
++    if (n == 0) {
++        return false;
++    }
++    std::sort(f, f + n);
++    std::sort(u, u + n);
++    const int64_t mf = f[n/2], mu = u[n/2];
++    // the card's size is taken once; after that free is what nobody holds, since the driver's own
++    // free counter lags behind memory that was released and can still be claimed
++    static int64_t size = 0;
++    if (size == 0) size = mf + mu;
++    const int64_t free_now = std::max<int64_t>(0, size - mu);
++    if (llabs(mf - free_now) > (256ll << 20)) {
++        fprintf(stderr, "tosh_vram: driver reports %lld MiB free, %lld MiB are not in use; using the latter\n",
++                (long long) (mf >> 20), (long long) (free_now >> 20));
++    }
++    *vfree = (size_t) free_now;
++    *total = (size_t) size;
++    return true;
++}
++
++namespace {
++struct rare_ctl {
++    std::mutex m;
++    std::atomic<int> rows{0};
++    int  max_rows = 8;
++    bool adapt = false;
++    struct layer { uint64_t host_seq = 0, dma_seq = 0; double dma_end[8] = {}; };
++    std::vector<layer> layers = std::vector<layer>(TOSH_DMOE_MAX_LAYERS);
++    int n = 0, n_late = 0;
++    double late_s = 0;
++    double prev_start = -1;
++    int    prev_tokens = 0;
++    double host_s = 0;              // host time of the chunk in progress
++    double share = -1;              // smoothed host share of a chunk
++    double target = 0.50;
++    double waited = -1;                 // smoothed share of layers whose join waited on the host
++    int    n_decode = 0;                // decode jobs since the last chunk
++    int    n_wait = 0;                  // layers whose join was already waiting when the host finished
++};
++rare_ctl g_rare;
++}
++
++void tosh_dmoe_rare_rows_init(int rows, int max_rows, bool adapt) {
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    g_rare.rows = rows; g_rare.max_rows = max_rows; g_rare.adapt = adapt;
++    if (const char * t = getenv("TOSH_DMOE_RARE_TARGET")) g_rare.target = atof(t);
++}
++int tosh_dmoe_rare_rows_live(void) { return g_rare.rows.load(std::memory_order_relaxed); }
++
++void tosh_dmoe_rare_dma_done(int il, double t_end) {
++    if (il < 0 || il >= TOSH_DMOE_MAX_LAYERS) return;
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    auto & L = g_rare.layers[il];
++    L.dma_end[L.dma_seq % 8] = t_end;
++    L.dma_seq++;
++}
++
++static void * g_reach_ev = nullptr;
++static uint64_t (*g_reach_get)(void *) = nullptr;
++void tosh_dmoe_set_reach_event(void * ev, uint64_t (*get)(void *)) { g_reach_ev = ev; g_reach_get = get; }
++uint64_t tosh_dmoe_reach_get(void) { return g_reach_get ? g_reach_get(g_reach_ev) : 0; }
++
++void tosh_dmoe_rare_host_done(int il, double t_start, double t_end, bool gpu_waiting) {
++    if (il < 0 || il >= TOSH_DMOE_MAX_LAYERS) return;
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    g_rare.host_s += t_end - t_start;
++    g_rare.n_wait += gpu_waiting;
++    auto & L = g_rare.layers[il];
++    const uint64_t h = L.host_seq++;
++    // the chunk's down bank already landed: the join waits on the host from here
++    if (L.dma_seq > h && L.dma_seq - h <= 8) {
++        g_rare.n_late++;
++        g_rare.late_s += t_end - L.dma_end[h % 8];
++    }
++    g_rare.n++;
++}
++
++void tosh_dmoe_rare_interrupt(void) {
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    g_rare.n_decode++;
++}
++
++void tosh_dmoe_rare_chunk(double t_start, int n_tokens) {
++    std::lock_guard<std::mutex> lock(g_rare.m);
++    // a model that narrows its last layer to the output rows runs one decode job per chunk; more
++    // than a few means decode ran in between and the period is not a measurement
++    const double prev = g_rare.n_decode > 8 ? -1.0 : g_rare.prev_start;
++    const int    prev_tokens = g_rare.prev_tokens;
++    g_rare.prev_start  = t_start;
++    g_rare.prev_tokens = n_tokens;
++    g_rare.n_decode    = 0;
++    if (prev < 0) {
++        g_rare.host_s = 0;
++        g_rare.n_wait = 0;
++        g_rare.n = 0;
++    }
++    // a gap longer than a chunk is decode or idle in between, not a measurement
++    if (prev < 0 || prev_tokens <= 0 || t_start - prev > 5.0) {
++        return;
++    }
++    const double share = g_rare.host_s/(t_start - prev);
++    g_rare.host_s = 0;
++    g_rare.share = g_rare.share < 0 ? share : 0.5*g_rare.share + 0.5*share;
++    if (g_rare.n > 0) {
++        const double w = (double) g_rare.n_wait/g_rare.n;
++        g_rare.waited = g_rare.waited < 0 ? w : 0.5*g_rare.waited + 0.5*w;
++    }
++    int r = g_rare.rows.load();
++    const int was = r;
++    if (g_rare.adapt && g_rare.waited >= 0) {
++        // two rows at a time while far from the target, so a short prompt still gets there
++        const int step = g_rare.waited < 0.10 || g_rare.waited > 0.90 ? 2 : 1;
++        if (g_rare.waited < g_rare.target - 0.15) r = std::min(r + step, g_rare.max_rows);
++        else if (g_rare.waited > g_rare.target + 0.15) r = std::max(r - step, 1);
++    }
++    if (getenv("TOSH_DMOE_STATS")) {
++        fprintf(stderr, "tosh_dmoe: rare-row threshold %d -> %d (host share %.2f, %.3f ms per token; join waited in %d of %d layers, %d finished after their down bank)\n",
++                was, r, g_rare.share, (t_start - prev)/prev_tokens*1e3, g_rare.n_wait, g_rare.n, g_rare.n_late);
++    }
++    g_rare.n_wait = 0;
++    g_rare.rows = r;
++    g_rare.n = 0; g_rare.n_late = 0; g_rare.late_s = 0;
++}
++
++bool tosh_dmoe_compact(void) {
++    static const bool on = getenv("TOSH_DMOE_COMPACT") == nullptr || atoi(getenv("TOSH_DMOE_COMPACT")) != 0;
++    return on && tosh_dmoe_enabled();
++}
++static const int32_t * g_chunk_rows = nullptr;
++static const float *   g_chunk_tail = nullptr;
++static int g_chunk_experts = 0;
++void tosh_dmoe_set_chunk_rows(const int32_t * rows, const float * tail, int n_expert) {
++    g_chunk_rows = rows; g_chunk_tail = tail; g_chunk_experts = n_expert;
++}
++const float * tosh_dmoe_chunk_tail(void) { return g_chunk_tail; }
++float tosh_dmoe_token_decay(void) {
++    static const float d = getenv("TOSH_DMOE_PREFILL_TOKEN_DECAY") ? (float) atof(getenv("TOSH_DMOE_PREFILL_TOKEN_DECAY")) : 0.95f;
++    return d;
++}
++static std::atomic<int64_t> g_pf_us[4];
++static std::atomic<int64_t> g_pf_n[4];
++static void pf_time_report() {
++    if (getenv("TOSH_DMOE_STATS") && g_pf_n[1].load() > 0) {
++        fprintf(stderr, "tosh_dmoe: prefill time waiting for ids %.1f ms (%lld), counting rows %.1f ms, issuing uploads %.1f ms (%lld), upload gpu %.1f ms (%lld)\n",
++                g_pf_us[0].load()/1e3, (long long) g_pf_n[0].load(), g_pf_us[3].load()/1e3, g_pf_us[1].load()/1e3, (long long) g_pf_n[1].load(),
++                g_pf_us[2].load()/1e3, (long long) g_pf_n[2].load());
++    }
++}
++void tosh_dmoe_note_time(int what, int64_t us) {
++    static std::once_flag once;
++    std::call_once(once, [] { atexit(pf_time_report); });
++    g_pf_us[what] += us;
++    g_pf_n[what]++;
++}
++const int32_t * tosh_dmoe_chunk_rows(int * n_expert) {
++    if (n_expert) *n_expert = g_chunk_experts;
++    return g_chunk_rows;
++}
++
++void tosh_dmoe_mark_completed(void) {
++    {
++        std::lock_guard<std::mutex> lock(g_done_mutex);
++        g_completed.fetch_add(1);
++    }
++    g_done_cv.notify_all();
++}
++
++uint64_t tosh_dmoe_completed_value(void) { return g_completed.load(); }
++
++bool tosh_dmoe_wait_completed(uint64_t seen, int timeout_us) {
++    std::unique_lock<std::mutex> lock(g_done_mutex);
++    return g_done_cv.wait_for(lock, std::chrono::microseconds(timeout_us), [seen] { return g_completed.load() != seen; });
++}
++
++void tosh_dmoe_set_bank_planner(tosh_dmoe_bank_plan_fn fn) { g_planner.store(fn); }
++
++bool tosh_dmoe_bank_planner(const void * host, size_t size, tosh_dmoe_bank_plan * plan) {
++    const tosh_dmoe_bank_plan_fn fn = g_planner.load();
++    return fn != nullptr && fn(host, size, plan);
++}
++
++void   tosh_dmoe_set_obs_ring(void * host) { g_obs_ring = host; }
++void * tosh_dmoe_obs_ring(void)            { return g_obs_ring; }
++uint64_t tosh_dmoe_obs_head(void)          { return g_obs_seq.load(); }
++
++tosh_dmoe_obs_record * tosh_dmoe_obs_reserve(int il, int n_used, int n_tokens) {
++    const uint32_t bytes = (uint32_t) n_used*n_tokens*sizeof(int32_t);
++    if (bytes == 0 || bytes > TOSH_DMOE_OBS_RING_BYTES/4) {
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(g_obs_mutex);
++    if (g_obs_off + bytes > TOSH_DMOE_OBS_RING_BYTES) {
++        g_obs_pos.fetch_add(TOSH_DMOE_OBS_RING_BYTES - g_obs_off);
++        g_obs_off = 0;
++    }
++    const uint64_t seq = g_obs_seq.load() + 1;
++    tosh_dmoe_obs_record * r = &g_obs[seq % TOSH_DMOE_OBS_RECORDS];
++    r->sync     = tosh_dmoe_completed_value();
++    r->offset   = g_obs_off;
++    r->pos      = g_obs_pos.load();
++    r->il       = il;
++    r->n_used   = n_used;
++    r->n_tokens = n_tokens;
++    r->tick     = (uint32_t) tosh_dmoe_tick();
++    __atomic_store_n(&r->seq, seq, __ATOMIC_RELEASE);
++    g_obs_seq.store(seq);
++    g_obs_off += (bytes + 255) & ~255u;
++    g_obs_pos.fetch_add((bytes + 255) & ~255u);
++    return r;
++}
++
++bool tosh_dmoe_obs_intact(const tosh_dmoe_obs_record * r) {
++    const uint64_t bytes = (uint64_t) r->n_used*r->n_tokens*sizeof(int32_t);
++    return g_obs_pos.load() - r->pos + bytes <= TOSH_DMOE_OBS_RING_BYTES;
++}
++
++tosh_dmoe_obs_record * tosh_dmoe_obs_record_at(uint64_t seq) {
++    tosh_dmoe_obs_record * r = &g_obs[seq % TOSH_DMOE_OBS_RECORDS];
++    return __atomic_load_n(&r->seq, __ATOMIC_ACQUIRE) == seq ? r : nullptr;
++}
++
++void tosh_dmoe_set_uploader(const tosh_dmoe_uploader * u) {
++    g_uploader = *u;
++    g_has_uploader.store(true);
++}
++
++static void (*g_uploader_factory)(void) = nullptr;
++void tosh_dmoe_set_uploader_factory(void (*make)(void)) { g_uploader_factory = make; }
++
++const tosh_dmoe_uploader * tosh_dmoe_get_uploader(void) {
++    static std::mutex m;
++    if (!g_has_uploader.load() && g_uploader_factory != nullptr) {
++        std::lock_guard<std::mutex> lock(m);
++        if (!g_has_uploader.load()) g_uploader_factory();
++    }
++    return g_has_uploader.load() ? &g_uploader : nullptr;
++}
++
++tosh_dmoe_job * tosh_dmoe_job_of(uint64_t value) {
++    return &g_jobs[(value >> 1) % TOSH_DMOE_RING];
++}
++
++void tosh_dmoe_set_active(bool active) {
++    if (g_active.exchange(active) == active) {
++        return;
++    }
++    if (active) {
++        std::lock_guard<std::mutex> lock(g_active_mutex);
++        g_active_cv.notify_all();
++    }
++}
++
++bool tosh_dmoe_is_active(void) { return g_active.load(std::memory_order_acquire); }
++
++bool tosh_dmoe_wait_active(int timeout_us) {
++    if (g_active.load()) {
++        return true;
++    }
++    std::unique_lock<std::mutex> lock(g_active_mutex);
++    return g_active_cv.wait_for(lock, std::chrono::microseconds(timeout_us), [] { return g_active.load(); });
++}
++
++void tosh_dmoe_fail(const char * why) {
++    const char * none = nullptr;
++    g_failed.compare_exchange_strong(none, why);
++}
++
++const char * tosh_dmoe_failed(void)  { return g_failed.load(); }
++void tosh_dmoe_clear_failure(void)   { g_failed.store(nullptr); }
+diff --git a/tosh-moe/tosh-dmoe.h b/tosh-moe/tosh-dmoe.h
+new file mode 100644
+index 000000000..cc40c42f8
+--- /dev/null
++++ b/tosh-moe/tosh-dmoe.h
+@@ -0,0 +1,215 @@
++// Rendezvous between the GPU side of mixed expert execution and the host executor.
++// The GPU publishes a layer's routing into a shared stage and signals an odd value; the host
++// computes the non-resident experts, writes them into the same stage and signals value + 1,
++// which the GPU waits on.
++
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define TOSH_DMOE_MAX_LAYERS 128
++#define TOSH_DMOE_MAX_TOKENS 8
++#define TOSH_DMOE_RING       1024
++#define TOSH_DMOE_VERSIONS   4
++
++struct tosh_dmoe_job {
++    uint64_t value;     // the publish value this job answers
++    int32_t  il;
++    int32_t  n_tokens;
++    int32_t  n_used;
++    int32_t  n_embd;
++    int32_t  version;   // residency table the GPU read, dynamic residency only
++    uint32_t tick;      // the graph it belongs to
++};
++
++// Stage layout of one layer, in bytes from the layer base.
++static inline size_t tosh_dmoe_off_act  (int n_embd, int n_used) { (void) n_embd; (void) n_used; return 0; }
++static inline size_t tosh_dmoe_off_ids  (int n_embd, int n_used) { (void) n_used; return (size_t) n_embd*TOSH_DMOE_MAX_TOKENS*4; }
++static inline size_t tosh_dmoe_off_slots(int n_embd, int n_used) { return tosh_dmoe_off_ids(n_embd, n_used) + (size_t) n_used*TOSH_DMOE_MAX_TOKENS*4; }
++static inline size_t tosh_dmoe_off_out  (int n_embd, int n_used) {
++    const size_t o = tosh_dmoe_off_slots(n_embd, n_used) + (size_t) n_used*TOSH_DMOE_MAX_TOKENS*4;
++    return (o + 255) & ~(size_t) 255;
++}
++static inline size_t tosh_dmoe_layer_stride(int n_embd, int n_used) {
++    const size_t o = tosh_dmoe_off_out(n_embd, n_used) + (size_t) n_embd*n_used*TOSH_DMOE_MAX_TOKENS*4;
++    return (o + 4095) & ~(size_t) 4095;
++}
++
++// Wide batches (prefill): experts routed to few rows of the chunk run on the host while the rest
++// is uploaded. One stage serves every layer, since a layer's join precedes the next publish.
++#define TOSH_DMOE_WIDE_MAX_TOKENS 2048
++#define TOSH_DMOE_WIDE_MAX_ROWS   1024
++static inline size_t tosh_dmoe_wide_off_ids(int n_tok, int n_embd, int n_used) { (void) n_used; return (size_t) n_tok*n_embd*4; }
++static inline size_t tosh_dmoe_wide_off_rmp(int n_tok, int n_embd, int n_used) { return tosh_dmoe_wide_off_ids(n_tok, n_embd, n_used) + (size_t) n_tok*n_used*4; }
++static inline size_t tosh_dmoe_wide_off_map(int n_tok, int n_embd, int n_used) { return tosh_dmoe_wide_off_rmp(n_tok, n_embd, n_used) + (size_t) n_tok*n_used*4; }
++static inline size_t tosh_dmoe_wide_off_out(int n_tok, int n_embd, int n_used) {
++    return (tosh_dmoe_wide_off_map(n_tok, n_embd, n_used) + (size_t) n_tok*n_used*4 + 255) & ~(size_t) 255;
++}
++static inline size_t tosh_dmoe_wide_bytes(int n_embd, int n_used) {
++    return tosh_dmoe_wide_off_out(TOSH_DMOE_WIDE_MAX_TOKENS, n_embd, n_used) + (size_t) TOSH_DMOE_WIDE_MAX_ROWS*n_embd*4;
++}
++void   tosh_dmoe_set_wide_stage(void * host, size_t bytes);
++void * tosh_dmoe_wide_stage(size_t * bytes);
++
++// Rare-row threshold the next wide publish uses. With adapt, it moves one row at a time to keep
++// the share of layers whose join is already waiting when the host finishes near a target
++// (TOSH_DMOE_RARE_TARGET): a short wait means the host took rows the uploads no longer carry.
++void tosh_dmoe_rare_rows_init(int rows, int max_rows, bool adapt);
++int  tosh_dmoe_rare_rows_live(void);
++void tosh_dmoe_rare_host_done(int il, double t_start, double t_end, bool gpu_waiting);
++// the GPU signals this event with a wide layer's publish value when it reaches that layer's join
++void     tosh_dmoe_set_reach_event(void * ev, uint64_t (*get)(void *));
++uint64_t tosh_dmoe_reach_get(void);
++void tosh_dmoe_rare_dma_done(int il, double t_end);
++void tosh_dmoe_rare_chunk(double t_start, int n_tokens);
++// a decode step ran: the next chunk's period would include it, so it is not a measurement
++void tosh_dmoe_rare_interrupt(void);
++
++// Prefill timeline for overlap studies (TOSH_DMOE_TIMELINE=<file>): kind, layer, host seconds.
++void tosh_dmoe_timeline(int kind, int il, double t0, double t1);
++double tosh_dmoe_host_seconds(void);
++
++// Free VRAM before this process allocated anything, and the card's total, as the driver sees them.
++void tosh_dmoe_set_vram(size_t free_at_start, size_t total);
++bool tosh_dmoe_vram(size_t * free_at_start, size_t * total);
++// The driver's live counters (free, and in use by every process), set by the GPU backend.
++void tosh_dmoe_set_vram_query(bool (*fn)(int64_t * vfree, int64_t * vused));
++// Free VRAM as the card's size less what every process holds, median of three samples. The
++// driver's free counter lags behind released memory; a disagreement is logged, not used.
++bool tosh_vram_read(size_t * vfree, size_t * total);
++// Mixed execution chosen at run time, after the environment was first read.
++void tosh_dmoe_enable(void);
++// VRAM this process holds in the GPU backend's own buffers, 0 when the backend does not say
++void   tosh_dmoe_set_private_query(size_t (*fn)(void));
++size_t tosh_dmoe_private_bytes(void);
++
++// Whether mixed expert execution is configured for this process; nothing runs otherwise.
++bool tosh_dmoe_enabled(void);
++
++// Set by the GPU backend.
++void     tosh_dmoe_set_stage(void * host, size_t layer_stride);
++void *   tosh_dmoe_stage_layer(int il);
++void     tosh_dmoe_set_event(void * ev, uint64_t (*get)(void *), void (*set)(void *, uint64_t));
++uint64_t tosh_dmoe_event_get(void);
++void     tosh_dmoe_event_set(uint64_t value);
++
++// Publish values are odd and grow in GPU order; the answer is value + 1. They are handed out
++// when a graph is submitted, so a publish and its join agree however the graph is split.
++uint64_t tosh_dmoe_next_value(void);
++
++struct tosh_dmoe_job * tosh_dmoe_job_of(uint64_t value);
++
++// The host executor only spins while a graph with mixed layers is in flight.
++void tosh_dmoe_set_active(bool active);
++bool tosh_dmoe_wait_active(int timeout_us);
++bool tosh_dmoe_is_active(void);
++
++// Dynamic residency. The GPU reads residency from host memory laid out as
++// [TOSH_DMOE_VERSIONS][TOSH_DMOE_MAX_LAYERS][n_expert] int32; each graph takes the published version when it is
++// submitted, so a table never changes under a running token.
++void      tosh_dmoe_set_tables(int32_t * host, size_t bytes, int n_layers, int n_expert);
++int32_t * tosh_dmoe_tables(size_t * bytes, int * n_layers, int * n_expert);
++void      tosh_dmoe_publish_version(int version);
++int       tosh_dmoe_published_version(void);
++
++// Graphs are counted as they are submitted. The completed count grows at every synchronize,
++// which waits for every graph submitted before it; submissions and synchronizes come from one
++// thread, so whatever a table published before sync k named is no longer read after sync k + 2.
++uint64_t tosh_dmoe_tick_next(void);
++// the last submitted graph was a wide batch (prefill) rather than mixed decode
++void     tosh_dmoe_note_wide(bool wide);
++bool     tosh_dmoe_wide(void);
++uint64_t tosh_dmoe_tick(void);
++void     tosh_dmoe_mark_completed(void);
++uint64_t tosh_dmoe_completed_value(void);
++uint64_t tosh_dmoe_last_value(void);
++bool     tosh_dmoe_wait_completed(uint64_t seen, int timeout_us);
++
++// Uploads host bytes into GPU tensors on a queue of their own, through a bounded stage.
++struct tosh_dmoe_copy {
++    const void * dst;       // ggml_tensor
++    size_t       offset;
++    const void * src;
++    size_t       size;
++};
++struct tosh_dmoe_uploader {
++    void *   ctx;
++    uint64_t (*upload)(void * ctx, const struct tosh_dmoe_copy * copies, int n);   // 0 on failure
++    int      (*status)(void * ctx, uint64_t ticket);    // 0 pending, 1 done, -1 failed
++    double   (*gpu_us)(void * ctx, uint64_t ticket);    // device time of a finished upload
++    // the other way: src is the ggml_tensor and dst host memory; returns once the bytes are there
++    bool     (*download)(void * ctx, const struct tosh_dmoe_copy * copies, int n);
++};
++void                              tosh_dmoe_set_uploader(const struct tosh_dmoe_uploader * u);
++const struct tosh_dmoe_uploader * tosh_dmoe_get_uploader(void);
++// the GPU backend makes the uploader the first time it is asked for
++void tosh_dmoe_set_uploader_factory(void (*make)(void));
++
++// Prefill. A bank upload asks for the layer's residency so resident experts come from the
++// VRAM arena and only the rest from host memory. Registered by whoever owns the banks.
++struct tosh_dmoe_bank_plan {
++    const void *    arena;          // ggml_tensor holding the resident copies, slot-major
++    const int32_t * slot_of;        // n_expert entries, slot or -1
++    int             n_expert;
++    size_t          expert_bytes;
++    // experts to copy from the freshly filled upload into free arena slots, for decode
++    const int32_t * promo_expert;
++    const int32_t * promo_slot;
++    int             n_promo;
++    // rows per expert of the chunk being uploaded, or null to carry the whole bank
++    const int32_t * rows;
++    int             il;
++    int             which;          // 0 gate, 1 up, 2 down
++};
++typedef bool (*tosh_dmoe_bank_plan_fn)(const void * host, size_t size, struct tosh_dmoe_bank_plan * plan);
++void tosh_dmoe_set_bank_planner(tosh_dmoe_bank_plan_fn fn);
++bool tosh_dmoe_bank_planner(const void * host, size_t size, struct tosh_dmoe_bank_plan * plan);
++
++// Prefill routing: the GPU copies a layer's ids into a host-visible ring and the policy reads
++// them once the graph has completed. Records are overwritten when the ring wraps.
++#define TOSH_DMOE_OBS_RING_BYTES (32u << 20)
++#define TOSH_DMOE_OBS_RECORDS    4096
++struct tosh_dmoe_obs_record {
++    uint64_t seq;           // 0 while unused
++    uint64_t sync;          // completed count when it was encoded
++    uint64_t pos;           // bytes reserved before it, never wraps
++    uint32_t offset;        // bytes into the ring
++    int32_t  il;
++    int32_t  n_used;
++    int32_t  n_tokens;
++    uint32_t tick;
++};
++void                          tosh_dmoe_set_obs_ring(void * host);
++void *                        tosh_dmoe_obs_ring(void);
++struct tosh_dmoe_obs_record * tosh_dmoe_obs_reserve(int il, int n_used, int n_tokens);   // null if too big
++struct tosh_dmoe_obs_record * tosh_dmoe_obs_record_at(uint64_t seq);
++uint64_t                      tosh_dmoe_obs_head(void);
++bool                          tosh_dmoe_obs_intact(const struct tosh_dmoe_obs_record * r);
++
++// A failure latches until cleared: every later publish is answered at once so the GPU never
++// waits forever, and the caller aborts the batch.
++void         tosh_dmoe_fail(const char * why);
++const char * tosh_dmoe_failed(void);
++void         tosh_dmoe_clear_failure(void);
++
++// Compact prefill: a wide batch uploads only the experts its chunk routes to. The scheduler reads
++// the chunk's ids and sets the rows per expert right before the bank upload that consumes them.
++bool            tosh_dmoe_compact(void);
++void            tosh_dmoe_set_chunk_rows(const int32_t * rows, const float * tail, int n_expert);
++const int32_t * tosh_dmoe_chunk_rows(int * n_expert);
++// per expert, its routing weighted by closeness to the chunk's end (TOSH_DMOE_PREFILL_TOKEN_DECAY)
++const float *   tosh_dmoe_chunk_tail(void);
++float           tosh_dmoe_token_decay(void);
++// prefill time accounting: 0 waiting for the chunk's ids, 1 issuing bank uploads, 2 upload GPU time,
++// 3 counting rows per expert
++void            tosh_dmoe_note_time(int what, int64_t us);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+new file mode 100644
+index 000000000..49adb07c4
+--- /dev/null
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -0,0 +1,930 @@
++#include "tosh-hostcache.h"
++#include "tosh-dmoe.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <fcntl.h>
++#include <pthread.h>
++#include <sys/mman.h>
++#include <sys/uio.h>
++#include <sys/param.h>
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
++#include <unistd.h>
++
++namespace {
++
++enum slot_state : uint8_t { EMPTY, LOADING, RESIDENT };
++
++// TOSH_HC_LOOKAHEAD=1 / TOSH_HC_PROMPT_LAST=1: prompt lookahead and prompt-first eviction, off by default
++static bool env_on(const char * name) {
++    const char * v = getenv(name);
++    return v != nullptr && strcmp(v, "0") != 0;
++}
++static constexpr int LOOKAHEAD_LAYERS = 2;
++
++struct file_tensor {
++    size_t   nbytes;
++    uint64_t file_off;
++    int      file;
++    uint64_t file_off_up = UINT64_MAX;   // up half of a gate/up pair the loader fused
++};
++
++struct part_ref {
++    uint64_t file_off  = 0;     // of expert 0
++    int      file      = 0;     // shard of a split model
++    size_t   bytes     = 0;     // per expert
++    size_t   slot_off  = 0;     // inside a cache slot
++};
++
++struct cache {
++    std::mutex              m;
++    std::condition_variable loaded;
++    std::condition_variable work;
++    std::deque<int>         queue;      // demand reads in front, read-backs of evicted experts behind
++    bool                    stop = false;
++
++    std::unordered_map<const void *, file_tensor> noted;
++    std::unordered_map<const void *, std::pair<int, int>> bank_of;   // tensor data -> (il, part)
++    std::vector<std::string> paths;     // model files; a split model has one per shard
++    std::vector<int> fds;
++
++    int n_layer = 0, n_expert = 0;
++    std::vector<part_ref> parts;        // [il*3 + part]
++    // one pool per expert size (mixed quantizations), each with its share of the capacity
++    struct pool { size_t slot_bytes = 0; int first = 0, n = 0; char * base = nullptr; size_t bytes = 0;
++                  std::vector<int> free_slots; int lru_head = -1, lru_tail = -1; };
++    std::vector<pool> pools;
++    std::vector<int> pool_of_layer, pool_of_slot;
++    char * base = nullptr;              // first pool, non-null once started
++    size_t cap_bytes = 0, locked_bytes = 0, resident_bytes = 0, peak_bytes = 0;
++    int n_slots = 0;
++
++    std::vector<int32_t>    slot_of;    // key -> slot
++    std::vector<uint8_t>    ever;       // key was read before
++    std::vector<double>     enq_t;      // when a slot's read was queued
++    std::vector<uint8_t>    bg;         // queued by a read-back, not by a demand
++    std::vector<uint8_t>    bg_unused;  // read back and not used since
++    std::vector<uint8_t>    origin;     // 0 read after the server was ready, 1 during warm-up, 2 warm-up fill
++    std::vector<uint8_t>    reused;     // a warm-up or fill entry hit after ready
++    std::atomic<bool>       ready{false};
++    std::thread             locker;
++    double   t_start = 0, t_ready = 0, fill_stop_t = 0;
++    uint64_t fill_n = 0, fill_bytes = 0, fill_dup = 0, fill_skipped = 0;
++    uint64_t reuse_n[3] = {}, reuse_bytes[3] = {}, loaded_n[3] = {}, loaded_bytes[3] = {};
++    std::vector<int32_t>    key_of, ref, prev, next;
++    std::vector<uint8_t>    state;
++    // a slot only a prompt has used goes first on eviction, ahead of the experts decode keeps using
++    std::vector<uint8_t>    prompt_only;
++    // prompt lookahead: the experts each layer pinned in its latest chunk, read ahead for the next one
++    std::vector<std::vector<int32_t>> pf_set;
++    std::vector<uint32_t>   pf_chunk_of;
++    uint32_t pf_chunk = 0;
++    int      pf_il = -1;
++    uint64_t ahead_queued = 0;
++
++    std::string error;
++
++    // stats
++    uint64_t req[TOSH_HC_KINDS] = {}, hit[TOSH_HC_KINDS] = {}, cold[TOSH_HC_KINDS] = {}, coalesced = 0;
++    uint64_t evictions = 0, reloads = 0, reads = 0, read_bytes = 0, prefetches = 0, stored = 0;
++    double wait_us[TOSH_HC_KINDS] = {};
++    // queue and read time per class (0 demand, 1 read-back), where acquire waits, read-back reuse
++    std::vector<float> qwait_us[2], rd_us[2];
++    uint64_t rd_n[2] = {}, rd_bytes[2] = {};
++    double wait_own_us[TOSH_HC_KINDS] = {}, wait_co_dem_us[TOSH_HC_KINDS] = {}, wait_co_bg_us[TOSH_HC_KINDS] = {};
++    uint64_t bg_used = 0, bg_used_loading = 0, bg_wasted = 0, bg_dropped_unused = 0;
++    size_t prewarm_bytes = 0; double prewarm_us = 0;
++    uint64_t boosted = 0, kept_on_promotion = 0, refreshed = 0;
++
++    // a free slot of layer il's pool, evicting the least recent unpinned one; -1 if all are pinned
++    int take_slot(int il) {
++        pool & pl = pools[pool_of_layer[il]];
++        int s;
++        if (!pl.free_slots.empty()) {
++            s = pl.free_slots.back();
++            pl.free_slots.pop_back();
++        } else {
++            s = pl.lru_tail;
++            if (s < 0) return -1;
++            lru_unlink(s);
++            slot_of[key_of[s]] = -1;
++            evictions++;
++            if (bg_unused[s]) { bg_wasted++; bg_unused[s] = 0; }
++            resident_bytes -= pl.slot_bytes;
++        }
++        resident_bytes += pl.slot_bytes;
++        peak_bytes = std::max(peak_bytes, resident_bytes);
++        return s;
++    }
++    std::vector<float> read_us;
++    std::atomic<uint64_t> cold_total{0};
++
++    char * slot_ptr(int s) { pool & p = pools[pool_of_slot[s]]; return p.base + (size_t) (s - p.first)*p.slot_bytes; }
++    void lru_unlink(int s) {
++        pool & p = pools[pool_of_slot[s]];
++        if (prev[s] >= 0) next[prev[s]] = next[s]; else if (p.lru_head == s) p.lru_head = next[s];
++        if (next[s] >= 0) prev[next[s]] = prev[s]; else if (p.lru_tail == s) p.lru_tail = prev[s];
++        prev[s] = next[s] = -1;
++    }
++    void lru_push_tail(int s) {
++        pool & p = pools[pool_of_slot[s]];
++        next[s] = -1;
++        prev[s] = p.lru_tail;
++        if (p.lru_tail >= 0) next[p.lru_tail] = s;
++        p.lru_tail = s;
++        if (p.lru_head < 0) p.lru_head = s;
++    }
++    void lru_push(int s) {
++        pool & p = pools[pool_of_slot[s]];
++        prev[s] = -1;
++        next[s] = p.lru_head;
++        if (p.lru_head >= 0) prev[p.lru_head] = s;
++        p.lru_head = s;
++        if (p.lru_tail < 0) p.lru_tail = s;
++    }
++    bool in_lru(int s) const { return prev[s] >= 0 || next[s] >= 0 || pools[pool_of_slot[s]].lru_head == s; }
++};
++
++cache g;
++
++double now_us() {
++    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++// Wired pages cannot be compressed or paged out: locking faster than the system frees memory
++// evicts the code pages of every other process, and a desktop stalls until the watchdog reboots it.
++bool mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
++    static const size_t step    = (size_t) 256 << 20;
++    static const double wait_us = 30e6;
++    char * base = (char *) addr;
++    for (size_t o = 0; o < bytes; o += step) {
++#ifdef __APPLE__
++        const double t0 = now_us();
++        for (;;) {
++            int lvl = 1; size_t len = sizeof(lvl);
++            if (sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &len, nullptr, 0) != 0 || lvl <= 1) {
++                break;
++            }
++            if (lvl >= 4 || now_us() - t0 > wait_us) {
++                snprintf(err, err_len, "DMOE_HOST_MEMORY_PRESSURE: the system reported %s memory pressure after %.0f of %.0f MiB were locked",
++                         lvl >= 4 ? "critical" : "sustained", o/1048576.0, bytes/1048576.0);
++                munlock(base, o);
++                return false;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
++#endif
++        if (getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr || mlock(base + o, std::min(step, bytes - o)) != 0) {
++            const int e = getenv("TOSH_DMOE_TEST_MLOCK_FAIL") != nullptr ? EAGAIN : errno;
++            snprintf(err, err_len, "DMOE_HOST_BANK_NOT_LOCKABLE: mlock failed after %.0f of %.0f MiB (%s)",
++                     o/1048576.0, bytes/1048576.0, strerror(e));
++            munlock(base, o);
++            return false;
++        }
++    }
++    return true;
++}
++
++void reader_main() {
++#ifdef __APPLE__
++    // the executor's threads run at this class and would otherwise starve the reads they wait on
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
++    for (;;) {
++        int s;
++        {
++            std::unique_lock<std::mutex> lock(g.m);
++            g.work.wait(lock, [] { return g.stop || !g.queue.empty(); });
++            if (g.stop) return;
++            s = g.queue.front();
++            g.queue.pop_front();
++        }
++        const int key = g.key_of[s];
++        const int il = key / g.n_expert, e = key % g.n_expert;
++        char * dst = g.slot_ptr(s);
++        const double t0 = now_us();
++        const int cls = g.bg[s];
++        const double tq = g.enq_t[s];
++        std::string err;
++        size_t total = 0;
++        for (int p = 0; p < 3 && err.empty(); ++p) {
++            const part_ref & pr = g.parts[il*3 + p];
++            size_t done = 0;
++            while (done < pr.bytes) {
++                const ssize_t r = pread(g.fds[pr.file], dst + pr.slot_off + done, pr.bytes - done, (off_t) (pr.file_off + (uint64_t) e*pr.bytes + done));
++                if (r <= 0) {
++                    err = r == 0 ? "short read of an expert from the model file" : std::string("pread: ") + strerror(errno);
++                    break;
++                }
++                done += (size_t) r;
++            }
++            total += done;
++        }
++        static const long fail_at = getenv("TOSH_DMOE_TEST_READ_FAIL") ? atol(getenv("TOSH_DMOE_TEST_READ_FAIL")) : -1;
++        if (fail_at >= 0 && (long) g.reads + 1 == fail_at && err.empty()) err = "injected read failure";
++        const double us = now_us() - t0;
++        {
++            std::lock_guard<std::mutex> lock(g.m);
++            if (!err.empty() && g.error.empty()) g.error = err;
++            if (g.qwait_us[cls].size() < (1u << 22)) { g.qwait_us[cls].push_back((float) (t0 - tq)); g.rd_us[cls].push_back((float) us); }
++            g.rd_n[cls]++; g.rd_bytes[cls] += total;
++            tosh_dmoe_timeline(8 + 2*cls, il, tq*1e-6, t0*1e-6);
++            tosh_dmoe_timeline(9 + 2*cls, il, t0*1e-6, (t0 + us)*1e-6);
++            g.state[s] = RESIDENT;
++            if (g.ref[s] == 0 && !g.in_lru(s)) g.lru_push(s);
++            g.reads++;
++            g.read_bytes += total;
++            if (g.read_us.size() < (1u << 22)) g.read_us.push_back((float) us);
++        }
++        g.loaded.notify_all();
++    }
++}
++
++}  // namespace
++
++extern "C" {
++
++bool tosh_hostcache_on(void) {
++    // only a yes is kept: the Auto plan sets the variable after its probes have asked
++    static std::atomic<bool> on{false};
++    if (on.load(std::memory_order_relaxed)) return true;
++    if (getenv("TOSH_DMOE_HOST_CACHE_MIB") == nullptr) return false;
++    on.store(true);
++    return true;
++}
++
++bool tosh_hostcache_is_bank_name(const char * name) {
++    const char * p = strstr(name, ".ffn_");
++    if (p == nullptr) return false;
++    return strcmp(p, ".ffn_gate_exps.weight") == 0 || strcmp(p, ".ffn_up_exps.weight") == 0 || strcmp(p, ".ffn_down_exps.weight") == 0 ||
++           strcmp(p, ".ffn_gate_up_exps.weight") == 0;
++}
++
++static int file_index(int fd) {
++    char buf[MAXPATHLEN];
++    if (fcntl(fd, F_GETPATH, buf) != 0) return -1;
++    int file = 0;
++    while (file < (int) g.paths.size() && g.paths[file] != buf) file++;
++    if (file == (int) g.paths.size()) g.paths.push_back(buf);
++    return file;
++}
++
++void tosh_hostcache_note_file_tensor(const void * data, size_t nbytes, int fd, uint64_t file_off) {
++    std::lock_guard<std::mutex> lock(g.m);
++    const int file = file_index(fd);
++    if (file >= 0) g.noted[data] = { nbytes, file_off, file };
++}
++
++void tosh_hostcache_note_fused_tensor(const void * data, size_t nbytes, int fd, uint64_t off_gate, uint64_t off_up) {
++    std::lock_guard<std::mutex> lock(g.m);
++    const int file = file_index(fd);
++    if (file >= 0) g.noted[data] = { nbytes, off_gate, file, off_up };
++}
++
++bool tosh_hostcache_bind(int il, int part, const void * data, size_t part_bytes, int n_expert) {
++    std::lock_guard<std::mutex> lock(g.m);
++    if (g.base != nullptr) return true;   // bound and started by the loader
++    auto it = g.noted.find(data);
++    if (it == g.noted.end() || it->second.nbytes != part_bytes*(size_t) n_expert || part < 0 || part > 2) {
++        g.error = "an expert bank was loaded, or has an unexpected size";
++        return false;
++    }
++    if ((int) g.parts.size() < (il + 1)*3) g.parts.resize((il + 1)*3);
++    const file_tensor & ft = it->second;
++    if (ft.file_off_up != UINT64_MAX) {
++        // fused gate/up: its gate and up halves are the slot's parts 0 and 1, adjacent in the slot
++        if (part != 0 || part_bytes % 2 != 0) { g.error = "a fused gate/up bank in an unexpected place"; return false; }
++        g.parts[il*3 + 0] = { ft.file_off,    ft.file, part_bytes/2, 0 };
++        g.parts[il*3 + 1] = { ft.file_off_up, ft.file, part_bytes/2, 0 };
++    } else {
++        g.parts[il*3 + part].file_off = ft.file_off;
++        g.parts[il*3 + part].file     = ft.file;
++        g.parts[il*3 + part].bytes    = part_bytes;
++    }
++    g.bank_of[data] = { il, part };
++    return true;
++}
++
++static void prewarm(int n_io);
++static void start_warmup_fill();
++
++bool tosh_hostcache_start(int n_layer, int n_expert) {
++    std::unique_lock<std::mutex> lock(g.m);
++    if (!g.error.empty()) return false;
++    if (g.base != nullptr) return true;   // started early by the loader
++    g.n_layer = n_layer;
++    g.n_expert = n_expert;
++    g.parts.resize(n_layer*3);
++    // a slot holds gate, up and down of one expert; layers with another expert size get their own pool
++    std::vector<size_t> layer_bytes(n_layer, 0);
++    for (int il = 0; il < n_layer; ++il) {
++        size_t off = 0;
++        for (int p = 0; p < 3; ++p) {
++            g.parts[il*3 + p].slot_off = off;
++            off += g.parts[il*3 + p].bytes;
++        }
++        layer_bytes[il] = off;
++    }
++    if (g.paths.empty()) { g.error = "no expert bank to cache"; return false; }
++    for (const auto & path : g.paths) {
++        const int fd = open(path.c_str(), O_RDONLY);
++        if (fd < 0) { g.error = "cannot open the model file for expert reads: " + path; return false; }
++        if (getenv("TOSH_DMOE_HOST_NOCACHE") != nullptr) fcntl(fd, F_NOCACHE, 1);
++        g.fds.push_back(fd);
++    }
++
++    g.cap_bytes = (size_t) (atof(getenv("TOSH_DMOE_HOST_CACHE_MIB"))*1048576.0);
++    size_t bank_bytes = 0;
++    g.pool_of_layer.assign(n_layer, -1);
++    for (int il = 0; il < n_layer; ++il) {
++        if (layer_bytes[il] == 0) continue;
++        bank_bytes += layer_bytes[il]*(size_t) n_expert;
++        int pi = -1;
++        for (int k = 0; k < (int) g.pools.size(); ++k) if (g.pools[k].slot_bytes == layer_bytes[il]) pi = k;
++        if (pi < 0) { pi = (int) g.pools.size(); g.pools.emplace_back(); g.pools.back().slot_bytes = layer_bytes[il]; }
++        g.pool_of_layer[il] = pi;
++    }
++    if (g.pools.empty()) { g.error = "no expert bank to cache"; return false; }
++    // every pool holds at least one layer's full expert set, since a prefill chunk can pin them all;
++    // the rest of the budget is shared in proportion to each size class
++    size_t floor_bytes = 0;
++    for (auto & pl : g.pools) floor_bytes += pl.slot_bytes*(size_t) n_expert;
++    if (floor_bytes > g.cap_bytes) { g.error = "the expert cache is smaller than one layer's experts per size class"; return false; }
++    for (auto & pl : g.pools) {
++        size_t class_bytes = 0;
++        for (int il = 0; il < n_layer; ++il) if (g.pool_of_layer[il] >= 0 && g.pools[g.pool_of_layer[il]].slot_bytes == pl.slot_bytes) class_bytes += pl.slot_bytes*(size_t) n_expert;
++        const size_t share = (size_t) ((double) (g.cap_bytes - floor_bytes)*class_bytes/bank_bytes) + pl.slot_bytes*(size_t) n_expert;
++        pl.n = (int) std::min(share/pl.slot_bytes, class_bytes/pl.slot_bytes);
++        pl.first = g.n_slots;
++        g.n_slots += pl.n;
++        pl.bytes = (size_t) pl.n*pl.slot_bytes;
++        void * p = mmap(nullptr, std::max<size_t>(pl.bytes, 1), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        if (p == MAP_FAILED) { g.error = "cannot allocate the expert cache"; return false; }
++        pl.base = (char *) p;
++        g.locked_bytes += pl.bytes;
++    }
++    g.base = g.pools[0].base;
++    const int n_keys = n_layer*n_expert;
++    g.slot_of.assign(n_keys, -1);
++    g.ever.assign(n_keys, 0);
++    g.key_of.assign(g.n_slots, -1);
++    g.ref.assign(g.n_slots, 0);
++    g.prev.assign(g.n_slots, -1);
++    g.next.assign(g.n_slots, -1);
++    g.state.assign(g.n_slots, EMPTY);
++    g.enq_t.assign(g.n_slots, 0.0);
++    g.bg.assign(g.n_slots, 0);
++    g.bg_unused.assign(g.n_slots, 0);
++    g.origin.assign(g.n_slots, 0);
++    g.reused.assign(g.n_slots, 0);
++    g.prompt_only.assign(g.n_slots, 0);
++    g.pf_set.assign(n_layer, {});
++    g.pf_chunk_of.assign(n_layer, UINT32_MAX);
++    g.pool_of_slot.assign(g.n_slots, 0);
++    for (int k = 0; k < (int) g.pools.size(); ++k) {
++        auto & pl = g.pools[k];
++        for (int s = pl.first + pl.n - 1; s >= pl.first; --s) { pl.free_slots.push_back(s); g.pool_of_slot[s] = k; }
++    }
++
++    const int n_io = std::max(1, getenv("TOSH_DMOE_HOST_IO") ? atoi(getenv("TOSH_DMOE_HOST_IO")) : 4);
++    for (int i = 0; i < n_io; ++i) std::thread(reader_main).detach();
++    for (auto & pl : g.pools) {
++        fprintf(stderr, "tosh_hostcache: pool of %d slots of %.3f MiB (%.0f MiB)\n", pl.n, pl.slot_bytes/1048576.0, pl.bytes/1048576.0);
++    }
++    fprintf(stderr, "tosh_hostcache: %.0f MiB locked for experts, %d readers, %zu file%s from %s\n", g.locked_bytes/1048576.0, n_io,
++            g.paths.size(), g.paths.size() > 1 ? "s" : "", g.paths[0].c_str());
++    g.t_start = now_us();
++    // locking zero-fills every page; with the warm-up fill on, the pages are filled with experts from
++    // the file while the lock proceeds, and the server waits for the lock before it is ready
++    const bool overlap = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB") != nullptr;
++    auto lock_pools = [] {
++        for (auto & pl : g.pools) {
++            char err[256];
++            if (!mlock_paced(pl.base, pl.bytes, err, sizeof(err))) {
++                std::lock_guard<std::mutex> lk(g.m);
++                if (g.error.empty()) g.error = err;
++                return;
++            }
++        }
++    };
++    lock.unlock();
++    if (overlap) {
++        g.locker = std::thread(lock_pools);
++        // a load that fails before ready exits with the lock thread still attached
++        static const bool joined_at_exit = atexit([] { if (g.locker.joinable()) g.locker.join(); }) == 0;
++        (void) joined_at_exit;
++        start_warmup_fill();
++    } else {
++        lock_pools();
++    }
++    prewarm(n_io);
++    return g.error.empty();
++}
++
++// EXPERIMENT: TOSH_DMOE_HOST_WARMUP_FILL_MIB (a number, or max) reads experts in file order into free
++// slots from the moment the model finishes loading, past ready, until the budget or the slots run
++// out. Demand never waits on it: an entry is published only once read, and last in line for eviction.
++static void start_warmup_fill() {
++    const char * v = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB");
++    if (v == nullptr) return;
++    const size_t budget = strcmp(v, "max") == 0 ? g.locked_bytes : (size_t) (atof(v)*1048576.0);
++    if (budget == 0) return;
++    const int n_th = std::max(1, getenv("TOSH_DMOE_HOST_FILL_IO") ? atoi(getenv("TOSH_DMOE_HOST_FILL_IO")) : 16);
++    auto next = std::make_shared<std::atomic<int>>(0);
++    auto left = std::make_shared<std::atomic<int>>(n_th);
++    for (int t = 0; t < n_th; ++t) {
++        std::thread([budget, next, left] {
++            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++            const int n_keys = g.n_layer*g.n_expert;
++            for (int key; (key = (*next)++) < n_keys;) {
++                const int il = key / g.n_expert, e = key % g.n_expert;
++                int s;
++                {
++                    std::lock_guard<std::mutex> lock(g.m);
++                    if (g.pool_of_layer[il] < 0 || g.slot_of[key] >= 0) continue;
++                    if (g.fill_bytes >= budget) break;
++                    auto & pl = g.pools[g.pool_of_layer[il]];
++                    if (pl.free_slots.empty()) { g.fill_skipped++; continue; }   // never evicts
++                    s = pl.free_slots.back();
++                    pl.free_slots.pop_back();
++                    g.resident_bytes += pl.slot_bytes;
++                    g.peak_bytes = std::max(g.peak_bytes, g.resident_bytes);
++                    g.key_of[s] = -1; g.state[s] = LOADING; g.ref[s] = 1;
++                    g.fill_bytes += pl.slot_bytes;
++                }
++                bool ok = true;
++                for (int p = 0; p < 3 && ok; ++p) {
++                    const part_ref & pr = g.parts[il*3 + p];
++                    size_t done = 0;
++                    while (ok && done < pr.bytes) {
++                        const ssize_t r = pread(g.fds[pr.file], g.slot_ptr(s) + pr.slot_off + done, pr.bytes - done,
++                                                (off_t) (pr.file_off + (uint64_t) e*pr.bytes + done));
++                        if (r <= 0) ok = false; else done += (size_t) r;
++                    }
++                }
++                std::lock_guard<std::mutex> lock(g.m);
++                auto & pl = g.pools[g.pool_of_slot[s]];
++                g.ref[s] = 0;
++                if (!ok || g.slot_of[key] >= 0) {
++                    // a demand read it meanwhile, or the read failed: the slot goes back
++                    g.state[s] = EMPTY;
++                    pl.free_slots.push_back(s);
++                    g.resident_bytes -= pl.slot_bytes;
++                    g.fill_bytes -= pl.slot_bytes;
++                    g.fill_dup++;
++                    continue;
++                }
++                g.key_of[s] = key; g.slot_of[key] = s; g.state[s] = RESIDENT;
++                g.ever[key] = 1; g.origin[s] = 2; g.reused[s] = 0;
++                g.lru_push_tail(s);
++                g.fill_n++;
++                g.loaded_n[2]++; g.loaded_bytes[2] += pl.slot_bytes;
++            }
++            if (--*left == 0) {
++                std::lock_guard<std::mutex> lock(g.m);
++                g.fill_stop_t = now_us();
++            }
++        }).detach();
++    }
++}
++
++// EXPERIMENT: fill part of the cache before the first request. TOSH_DMOE_HOST_PREWARM_MIB bytes, taken
++// in layer order (TOSH_DMOE_HOST_PREWARM=seq) or from a list of "layer expert" lines; read one
++// expert at a time in list order, or (TOSH_DMOE_HOST_PREWARM_ORDER=offset) in file order with
++// adjacent experts of a tensor merged into one read
++static void prewarm(int n_io) {
++    const char * mib = getenv("TOSH_DMOE_HOST_PREWARM_MIB");
++    if (mib == nullptr || atof(mib) <= 0) return;
++    const size_t budget = (size_t) (atof(mib)*1048576.0);
++    const char * src = getenv("TOSH_DMOE_HOST_PREWARM") ? getenv("TOSH_DMOE_HOST_PREWARM") : "seq";
++    const bool by_offset = getenv("TOSH_DMOE_HOST_PREWARM_ORDER") && strcmp(getenv("TOSH_DMOE_HOST_PREWARM_ORDER"), "offset") == 0;
++    const double t0 = now_us();
++    std::vector<int> keys;
++    if (strcmp(src, "seq") == 0) {
++        for (int il = 0; il < g.n_layer; ++il) {
++            if (g.pool_of_layer[il] < 0) continue;
++            for (int e = 0; e < g.n_expert; ++e) keys.push_back(il*g.n_expert + e);
++        }
++    } else if (FILE * f = fopen(src, "r")) {
++        int il, e;
++        while (fscanf(f, "%d %d", &il, &e) == 2) {
++            if (il >= 0 && il < g.n_layer && e >= 0 && e < g.n_expert && g.pool_of_layer[il] >= 0) keys.push_back(il*g.n_expert + e);
++        }
++        fclose(f);
++    }
++    std::vector<int> slots;
++    size_t bytes = 0;
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        for (int key : keys) {
++            const int il = key / g.n_expert;
++            auto & pl = g.pools[g.pool_of_layer[il]];
++            if (bytes + pl.slot_bytes > budget) break;
++            if (g.slot_of[key] >= 0 || pl.free_slots.empty()) continue;
++            const int s = g.take_slot(il);
++            g.key_of[s] = key; g.slot_of[key] = s; g.state[s] = LOADING; g.ref[s] = 0; g.ever[key] = 1;
++            slots.push_back(s);
++            bytes += pl.slot_bytes;
++        }
++    }
++    // one read job: a range of one part tensor landing in the parts of one or more slots
++    struct job { int il, part, e0; std::vector<int> s; };
++    std::vector<job> jobs;
++    if (by_offset) {
++        std::vector<int> order = slots;
++        std::sort(order.begin(), order.end(), [](int a, int b) { return g.key_of[a] < g.key_of[b]; });
++        for (int part = 0; part < 3; ++part) {
++            for (size_t i = 0; i < order.size();) {
++                const int k0 = g.key_of[order[i]];
++                if (g.parts[k0 / g.n_expert*3 + part].bytes == 0) { i++; continue; }   // no such part (fused gate/up)
++                job j{ k0 / g.n_expert, part, k0 % g.n_expert, { order[i] } };
++                size_t k = i + 1;
++                // a run stays inside one layer's tensor
++                while (k < order.size() && g.key_of[order[k]] == k0 + (int) (k - i) && g.key_of[order[k]] / g.n_expert == j.il &&
++                       j.s.size() < 64) j.s.push_back(order[k++]);
++                jobs.push_back(std::move(j));
++                i = k;
++            }
++        }
++        std::sort(jobs.begin(), jobs.end(), [](const job & a, const job & b) {
++            const uint64_t oa = g.parts[a.il*3 + a.part].file_off + (uint64_t) a.e0*g.parts[a.il*3 + a.part].bytes;
++            const uint64_t ob = g.parts[b.il*3 + b.part].file_off + (uint64_t) b.e0*g.parts[b.il*3 + b.part].bytes;
++            return oa < ob;
++        });
++    } else {
++        for (int s : slots) {
++            const int k = g.key_of[s];
++            for (int part = 0; part < 3; ++part) {
++                if (g.parts[k / g.n_expert*3 + part].bytes > 0) jobs.push_back({ k / g.n_expert, part, k % g.n_expert, { s } });
++            }
++        }
++    }
++    std::atomic<size_t> next{0};
++    std::atomic<uint64_t> n_reads{0};
++    std::vector<std::thread> th;
++    for (int t = 0; t < n_io; ++t) {
++        th.emplace_back([&] {
++            for (size_t i; (i = next++) < jobs.size();) {
++                const job & j = jobs[i];
++                const part_ref & pr = g.parts[j.il*3 + j.part];
++                std::vector<iovec> iov(j.s.size());
++                for (size_t k = 0; k < j.s.size(); ++k) iov[k] = { g.slot_ptr(j.s[k]) + pr.slot_off, pr.bytes };
++                const size_t want = pr.bytes*j.s.size();
++                size_t got = 0;
++                const off_t off = (off_t) (pr.file_off + (uint64_t) j.e0*pr.bytes);
++                while (got < want) {
++                    // resume a short read inside the vector
++                    size_t skip = got, k = 0;
++                    while (skip >= iov[k].iov_len) { skip -= iov[k].iov_len; k++; }
++                    iovec first = { (char *) iov[k].iov_base + skip, iov[k].iov_len - skip };
++                    std::vector<iovec> rest(iov.begin() + k, iov.end());
++                    rest[0] = first;
++                    const ssize_t r = preadv(g.fds[pr.file], rest.data(), (int) rest.size(), off + (off_t) got);
++                    if (r <= 0) { std::lock_guard<std::mutex> lock(g.m); if (g.error.empty()) g.error = "prewarm read failed"; return; }
++                    got += (size_t) r;
++                }
++                n_reads++;
++            }
++        });
++    }
++    for (auto & t : th) t.join();
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        for (int s : slots) { g.state[s] = RESIDENT; g.lru_push(s); }
++        g.prewarm_bytes = bytes;
++        g.prewarm_us = now_us() - t0;
++    }
++    fprintf(stderr, "tosh_hostcache: prewarm %zu experts, %.0f MiB from %s in %s order, %llu reads, %.0f ms (%.2f GB/s)\n",
++            slots.size(), bytes/1048576.0, strcmp(src, "seq") == 0 ? "layer order" : "a list", by_offset ? "file" : "list",
++            (unsigned long long) n_reads.load(), g.prewarm_us/1000, bytes/(g.prewarm_us*1e3));
++}
++
++bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
++    return mlock_paced(addr, bytes, err, err_len);
++}
++
++static int readback_slot(int il, int e);
++
++bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
++    const double t0 = now_us();
++    std::unique_lock<std::mutex> lock(g.m);
++    std::vector<int> wait;
++    std::vector<uint8_t> wait_cls;     // 0 own read, 1 another demand, 2 a read-back
++    bool queued = false;
++    const bool prompt = kind == TOSH_HC_PREFILL || kind == TOSH_HC_WIDE;
++    if (prompt && g.base != nullptr) {
++        static const bool lookahead = env_on("TOSH_HC_LOOKAHEAD");
++        // a chunk walks the layers in order; host rows may trail the uploads by a layer
++        if (il + 2 < g.pf_il) { g.pf_chunk++; g.pf_il = il; } else g.pf_il = std::max(g.pf_il, il);
++        if (g.pf_chunk_of[il] != g.pf_chunk) {
++            g.pf_chunk_of[il] = g.pf_chunk;
++            g.pf_set[il].clear();
++            // the next layers still hold the last chunk's experts: their reads go behind the demands
++            for (int d = 1; d <= LOOKAHEAD_LAYERS && lookahead && il + d < g.n_layer; ++d) {
++                auto & set = g.pf_set[il + d];
++                std::sort(set.begin(), set.end());
++                set.erase(std::unique(set.begin(), set.end()), set.end());
++                for (int32_t e : set) {
++                    const int sl = readback_slot(il + d, e);
++                    if (sl < 0) continue;
++                    g.prompt_only[sl] = 1;
++                    g.queue.push_back(sl);
++                    g.ahead_queued++;
++                    queued = true;
++                }
++            }
++        }
++        g.pf_set[il].insert(g.pf_set[il].end(), ids, ids + n);
++    }
++    for (int i = 0; i < n; ++i) {
++        const int e = ids[i];
++        if (e < 0 || e >= g.n_expert) continue;
++        const int key = il*g.n_expert + e;
++        g.req[kind]++;
++        int s = g.slot_of[key];
++        if (s >= 0) {
++            if (!prompt) g.prompt_only[s] = 0;
++            if (g.ref[s]++ == 0 && g.in_lru(s)) g.lru_unlink(s);
++            if (g.bg_unused[s]) {
++                g.bg_unused[s] = 0;
++                g.bg_used++;
++                if (g.state[s] != RESIDENT) g.bg_used_loading++;
++            }
++            if (g.ready && g.origin[s] != 0 && !g.reused[s]) {
++                g.reused[s] = 1;
++                g.reuse_n[g.origin[s]]++;
++                g.reuse_bytes[g.origin[s]] += g.pools[g.pool_of_slot[s]].slot_bytes;
++            }
++            if (g.state[s] == RESIDENT) {
++                g.hit[kind]++;
++            } else {
++                g.coalesced++;
++                wait.push_back(s);
++                wait_cls.push_back(g.bg[s] ? 2 : 1);
++                if (g.bg[s]) {
++                    // a demand waits on a queued read-back: it goes ahead of the backlog
++                    auto it = std::find(g.queue.begin(), g.queue.end(), s);
++                    if (it != g.queue.end()) {
++                        g.queue.erase(it);
++                        g.queue.push_front(s);
++                        g.boosted++;
++                        queued = true;
++                    }
++                }
++            }
++            continue;
++        }
++        s = g.take_slot(il);
++        if (s < 0) {
++            if (g.error.empty()) g.error = "the expert cache is smaller than the experts pinned at once";
++            return false;
++        }
++        g.key_of[s] = key;
++        g.slot_of[key] = s;
++        g.state[s] = LOADING;
++        g.ref[s] = 1;
++        g.prompt_only[s] = prompt;
++        g.cold[kind]++;
++        g.cold_total++;
++        g.reloads += g.ever[key];
++        g.ever[key] = 1;
++        g.enq_t[s] = now_us();
++        g.bg[s] = 0;
++        g.bg_unused[s] = 0;
++        g.origin[s] = g.ready ? 0 : 1;
++        g.reused[s] = 0;
++        g.loaded_n[g.origin[s]]++;
++        g.loaded_bytes[g.origin[s]] += g.pools[g.pool_of_slot[s]].slot_bytes;
++        g.queue.push_front(s);    // ahead of the read-backs of evicted experts
++        queued = true;
++        wait.push_back(s);
++        wait_cls.push_back(0);
++    }
++    if (queued) g.work.notify_all();
++    for (size_t i = 0; i < wait.size(); ++i) {
++        const int s = wait[i];
++        const double tw = now_us();
++        g.loaded.wait(lock, [s] { return g.state[s] == RESIDENT; });
++        const double dt = now_us() - tw;
++        if (wait_cls[i] == 0) g.wait_own_us[kind] += dt; else if (wait_cls[i] == 1) g.wait_co_dem_us[kind] += dt; else g.wait_co_bg_us[kind] += dt;
++    }
++    const double t1 = now_us();
++    g.wait_us[kind] += t1 - t0;
++    if (!wait.empty()) tosh_dmoe_timeline(30 + kind, il, t0*1e-6, t1*1e-6);
++    return g.error.empty();
++}
++
++const char * tosh_hostcache_part(int il, int e, int part) {
++    const int s = g.slot_of[il*g.n_expert + e];
++    return s < 0 ? nullptr : g.slot_ptr(s) + g.parts[il*3 + part].slot_off;
++}
++
++void tosh_hostcache_release(int il, const int32_t * ids, int n) {
++    std::lock_guard<std::mutex> lock(g.m);
++    for (int i = 0; i < n; ++i) {
++        const int e = ids[i];
++        if (e < 0 || e >= g.n_expert) continue;
++        const int s = g.slot_of[il*g.n_expert + e];
++        if (s >= 0 && --g.ref[s] == 0) {
++            static const bool prompt_last = env_on("TOSH_HC_PROMPT_LAST");
++            if (prompt_last && g.prompt_only[s]) g.lru_push_tail(s); else g.lru_push(s);
++        }
++    }
++}
++
++void tosh_hostcache_drop(int il, int e) {
++    std::lock_guard<std::mutex> lock(g.m);
++    if (g.base == nullptr) return;
++    const int key = il*g.n_expert + e;
++    const int s = g.slot_of[key];
++    if (s < 0 || g.ref[s] != 0 || g.state[s] != RESIDENT) return;
++    if (g.bg_unused[s]) { g.bg_unused[s] = 0; g.bg_dropped_unused++; }
++    // the copy stays, first in line for eviction: if the expert leaves VRAM before it is evicted
++    // here, nothing has to be read back
++    g.lru_unlink(s);
++    g.lru_push_tail(s);
++    g.kept_on_promotion++;
++}
++
++// a slot for an expert coming back from VRAM, or -1 when RAM still holds it or has no room; g.m held
++static int readback_slot(int il, int e) {
++    const int key = il*g.n_expert + e;
++    if (g.base == nullptr) return -1;
++    if (g.slot_of[key] >= 0) {
++        // a copy kept on promotion: it is needed again
++        const int s = g.slot_of[key];
++        if (g.ref[s] == 0 && g.state[s] == RESIDENT && g.in_lru(s)) { g.lru_unlink(s); g.lru_push(s); g.refreshed++; }
++        return -1;
++    }
++    const int s = g.take_slot(il);
++    if (s < 0) return -1;
++    g.key_of[s] = key;
++    g.slot_of[key] = s;
++    g.state[s] = LOADING;
++    g.ref[s] = 0;
++    g.ever[key] = 1;
++    g.enq_t[s] = now_us();
++    g.bg[s] = 1;
++    g.bg_unused[s] = 1;
++    g.origin[s] = g.ready ? 0 : 1;
++    g.reused[s] = 0;
++    g.prompt_only[s] = 0;
++    return s;
++}
++
++void tosh_hostcache_prefetch(int il, int e) {
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        const int s = readback_slot(il, e);
++        if (s < 0) return;
++        g.prefetches++;
++        g.queue.push_back(s);
++    }
++    g.work.notify_one();
++}
++
++bool tosh_hostcache_store(int il, int e) {
++    std::lock_guard<std::mutex> lock(g.m);
++    return readback_slot(il, e) >= 0;
++}
++
++void tosh_hostcache_store_done(int il, int e, bool ok) {
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        const int s = g.base == nullptr ? -1 : g.slot_of[il*g.n_expert + e];
++        if (s < 0 || g.state[s] != LOADING) return;
++        if (ok) {
++            g.state[s] = RESIDENT;
++            if (g.ref[s] == 0 && !g.in_lru(s)) g.lru_push(s);
++            g.stored++;
++        } else {
++            g.prefetches++;
++            g.queue.push_back(s);
++        }
++    }
++    if (ok) g.loaded.notify_all(); else g.work.notify_one();
++}
++
++bool tosh_hostcache_lookup(const void * data, int * il, int * part) {
++    std::lock_guard<std::mutex> lock(g.m);
++    auto it = g.bank_of.find(data);
++    if (it == g.bank_of.end()) return false;
++    *il = it->second.first;
++    *part = it->second.second;
++    return true;
++}
++
++bool tosh_hostcache_bytecheck(const void * data, size_t part_bytes, int e) {
++    file_tensor ft;
++    std::string path;
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        auto it = g.noted.find(data);
++        if (it == g.noted.end()) return false;
++        ft = it->second;
++        path = g.paths[ft.file];
++    }
++    const int fd = open(path.c_str(), O_RDONLY);
++    if (fd < 0) return false;
++    fcntl(fd, F_NOCACHE, 1);
++    const bool fused = ft.file_off_up != UINT64_MAX;
++    const size_t n = fused ? part_bytes/2 : part_bytes;
++    std::vector<char> buf(part_bytes);
++    bool ok = pread(fd, buf.data(), n, (off_t) (ft.file_off + (uint64_t) e*n)) == (ssize_t) n;
++    if (ok && fused) ok = pread(fd, buf.data() + n, n, (off_t) (ft.file_off_up + (uint64_t) e*n)) == (ssize_t) n;
++    ok = ok && memcmp(buf.data(), (const char *) data + (size_t) e*part_bytes, part_bytes) == 0;
++    close(fd);
++    return ok;
++}
++
++int tosh_hostcache_n_files(void) {
++    std::lock_guard<std::mutex> lock(g.m);
++    return (int) g.paths.size();
++}
++
++const char * tosh_hostcache_error(void) {
++    return g.error.empty() ? nullptr : g.error.c_str();
++}
++
++uint64_t tosh_hostcache_cold_reads(void) {
++    return g.cold_total.load();
++}
++
++bool tosh_hostcache_warmup_done(void) {
++    if (g.base == nullptr || g.ready) return g.error.empty();
++    // never ready with an unlocked cache
++    if (g.locker.joinable()) g.locker.join();
++    std::lock_guard<std::mutex> lock(g.m);
++    g.ready = true;
++    g.t_ready = now_us();
++    uint64_t hits = 0;
++    for (int k = 0; k < TOSH_HC_KINDS; ++k) hits += g.hit[k];
++    if (!g.error.empty()) fprintf(stderr, "tosh_hostcache: %s\n", g.error.c_str());
++    fprintf(stderr, "tosh_hostcache: ready %.0f ms after the cache started | resident %.0f MiB (%.1f%% of %.0f locked) | warm-up read %llu experts (%.0f MiB), hits %llu | fill %llu experts (%.0f MiB) so far\n",
++            (g.t_ready - g.t_start)/1000, g.resident_bytes/1048576.0, 100.0*g.resident_bytes/std::max<size_t>(1, g.locked_bytes), g.locked_bytes/1048576.0,
++            (unsigned long long) g.loaded_n[1], g.loaded_bytes[1]/1048576.0, (unsigned long long) hits,
++            (unsigned long long) g.fill_n, g.fill_bytes/1048576.0);
++    return g.error.empty();
++}
++
++void tosh_hostcache_report(void) {
++    std::lock_guard<std::mutex> lock(g.m);
++    if (g.base == nullptr) return;
++    static const char * names[TOSH_HC_KINDS] = { "decode", "wide", "promote", "prefill", "verify" };
++    for (int k = 0; k < TOSH_HC_KINDS; ++k) {
++        if (g.req[k] == 0) continue;
++        fprintf(stderr, "tosh_hostcache: %-7s requests %llu, warm hits %llu (%.2f%%), cold %llu, waited %.1f ms\n", names[k],
++                (unsigned long long) g.req[k], (unsigned long long) g.hit[k], 100.0*g.hit[k]/g.req[k], (unsigned long long) g.cold[k], g.wait_us[k]/1000);
++    }
++    auto pq = [](std::vector<float> v, double f) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return (double) v[std::min(v.size() - 1, (size_t) (f*v.size()))]; };
++    for (int c = 0; c < 2; ++c) {
++        fprintf(stderr, "tosh_hostcache: %s reads %llu (%.1f MiB) | queue wait p50 %.0f p95 %.0f p99 %.0f us | read p50 %.0f p95 %.0f p99 %.0f us\n",
++                c ? "read-back" : "demand   ", (unsigned long long) g.rd_n[c], g.rd_bytes[c]/1048576.0,
++                pq(g.qwait_us[c], 0.5), pq(g.qwait_us[c], 0.95), pq(g.qwait_us[c], 0.99), pq(g.rd_us[c], 0.5), pq(g.rd_us[c], 0.95), pq(g.rd_us[c], 0.99));
++    }
++    for (int k = 0; k < TOSH_HC_KINDS; ++k) {
++        if (g.req[k] == 0) continue;
++        fprintf(stderr, "tosh_hostcache: %-7s waits: own reads %.1f ms, another demand %.1f ms, a read-back %.1f ms\n", names[k],
++                g.wait_own_us[k]/1000, g.wait_co_dem_us[k]/1000, g.wait_co_bg_us[k]/1000);
++    }
++    const uint64_t bg_left = [] { uint64_t n = 0; for (auto u : g.bg_unused) n += u; return n; }();
++    fprintf(stderr, "tosh_hostcache: read-backs used %llu (%llu while loading), evicted unused %llu, dropped unused %llu, still unused %llu\n",
++            (unsigned long long) g.bg_used, (unsigned long long) g.bg_used_loading, (unsigned long long) g.bg_wasted,
++            (unsigned long long) g.bg_dropped_unused, (unsigned long long) bg_left);
++    fprintf(stderr, "tosh_hostcache: prompt lookahead queued %llu reads\n", (unsigned long long) g.ahead_queued);
++    fprintf(stderr, "tosh_hostcache: file reads: first touch %llu, capacity miss %llu, read-back %llu\n",
++            (unsigned long long) (g.rd_n[0] > g.reloads ? g.rd_n[0] - g.reloads : 0), (unsigned long long) g.reloads, (unsigned long long) g.rd_n[1]);
++    fprintf(stderr, "tosh_hostcache: read-backs moved ahead for a waiting demand %llu | promoted copies kept %llu, refreshed on eviction %llu\n",
++            (unsigned long long) g.boosted, (unsigned long long) g.kept_on_promotion, (unsigned long long) g.refreshed);
++    std::vector<float> v = g.read_us;
++    std::sort(v.begin(), v.end());
++    auto q = [&](double f) { return v.empty() ? 0.0 : (double) v[std::min(v.size() - 1, (size_t) (f*v.size()))]; };
++    fprintf(stderr, "tosh_hostcache: read back on eviction %llu, copied back from VRAM %llu\n",
++            (unsigned long long) g.prefetches, (unsigned long long) g.stored);
++    if (g.t_ready > 0) {
++        fprintf(stderr, "tosh_hostcache: loaded before ready: warm-up %llu (%.0f MiB), fill %llu (%.0f MiB, %llu superseded, stopped %.0f ms after ready) | used after ready: warm-up %llu (%.0f MiB), fill %llu (%.0f MiB)\n",
++                (unsigned long long) g.loaded_n[1], g.loaded_bytes[1]/1048576.0, (unsigned long long) g.loaded_n[2], g.loaded_bytes[2]/1048576.0,
++                (unsigned long long) g.fill_dup, g.fill_stop_t > 0 ? (g.fill_stop_t - g.t_ready)/1000 : -1.0,
++                (unsigned long long) g.reuse_n[1], g.reuse_bytes[1]/1048576.0, (unsigned long long) g.reuse_n[2], g.reuse_bytes[2]/1048576.0);
++    }
++    fprintf(stderr, "tosh_hostcache: reads %llu (%.1f MiB), coalesced %llu, evictions %llu, reloads %llu | expert read p50 %.0f p95 %.0f p99 %.0f us | resident %.0f MiB, peak %.0f MiB of %.0f locked\n",
++            (unsigned long long) g.reads, g.read_bytes/1048576.0, (unsigned long long) g.coalesced, (unsigned long long) g.evictions,
++            (unsigned long long) g.reloads, q(0.5), q(0.95), q(0.99), g.resident_bytes/1048576.0,
++            g.peak_bytes/1048576.0, g.locked_bytes/1048576.0);
++}
++
++}  // extern "C"
+diff --git a/tosh-moe/tosh-hostcache.h b/tosh-moe/tosh-hostcache.h
+new file mode 100644
+index 000000000..597bd9b29
+--- /dev/null
++++ b/tosh-moe/tosh-hostcache.h
+@@ -0,0 +1,70 @@
++// EXPERIMENTAL bounded host expert cache (TOSH_DMOE_HOST_CACHE_MIB). The expert bank tensors hold
++// no data: whole experts are read from the model file with pread into a locked RAM cache on
++// demand, and every host reader of the bank goes through this cache.
++
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum tosh_hostcache_kind {
++    TOSH_HC_DECODE = 0,     // decode rows the host computes
++    TOSH_HC_WIDE,           // rare prefill rows the host computes
++    TOSH_HC_PROMOTE,        // uploads into the VRAM arena
++    TOSH_HC_PREFILL,        // prefill bank uploads
++    TOSH_HC_VERIFY,
++    TOSH_HC_KINDS,
++};
++
++bool tosh_hostcache_on(void);
++bool tosh_hostcache_is_bank_name(const char * name);
++
++// loader: a bank tensor left unread, with where its bytes are in the file
++void tosh_hostcache_note_file_tensor(const void * data, size_t nbytes, int fd, uint64_t file_off);
++// a gate/up pair the loader fuses: expert e is gate row block e then up row block e of the file
++void tosh_hostcache_note_fused_tensor(const void * data, size_t nbytes, int fd, uint64_t off_gate, uint64_t off_up);
++
++// Dynamic MoE init: layer il's part (0 gate, 1 up, 2 down) is the noted tensor at data
++bool tosh_hostcache_bind(int il, int part, const void * data, size_t part_bytes, int n_expert);
++// allocates and locks the cache and starts the readers; false with tosh_hostcache_error() set
++bool tosh_hostcache_start(int n_layer, int n_expert);
++
++// locks [addr, addr+bytes) a step at a time, waiting while the system reports memory pressure;
++// false with a message in err (at least 256 bytes) when the lock fails or the pressure stays up
++bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len);
++
++// pins experts ids[0..n) of layer il, reading the missing ones; false after a read failure
++bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind);
++const char * tosh_hostcache_part(int il, int e, int part);
++void tosh_hostcache_release(int il, const int32_t * ids, int n);
++
++// an expert promoted to VRAM keeps its RAM copy first in line for eviction (drop); one leaving
++// VRAM without a copy is read back in the background, behind demand reads (prefetch)
++void tosh_hostcache_drop(int il, int e);
++void tosh_hostcache_prefetch(int il, int e);
++// the same expert, when the caller copies its bytes out of VRAM instead: true when a slot waits
++// for them at tosh_hostcache_part(); done publishes it, or falls back to the file read
++bool tosh_hostcache_store(int il, int e);
++void tosh_hostcache_store_done(int il, int e, bool ok);
++
++// bank tensor data pointer -> layer and part, for uploads that only know the source pointer
++bool tosh_hostcache_lookup(const void * data, int * il, int * part);
++
++// full bank loaded: expert e of a noted tensor read with pread equals the loaded bytes
++bool tosh_hostcache_bytecheck(const void * data, size_t part_bytes, int e);
++int  tosh_hostcache_n_files(void);
++
++const char * tosh_hostcache_error(void);
++uint64_t     tosh_hostcache_cold_reads(void);
++void         tosh_hostcache_report(void);
++// the server finished its warm-up and is about to be ready: warm-up fill stops, reuse is counted
++bool         tosh_hostcache_warmup_done(void);   // false: the cache could not be locked, nothing may run
++
++#ifdef __cplusplus
++}
++#endif

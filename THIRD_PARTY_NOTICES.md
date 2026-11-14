@@ -68,3 +68,19 @@ next to `toshmap.js`.
 
 Map data is not redistributed. The online map is OpenFreeMap, and both it and PMTiles regions
 from Protomaps carry OpenStreetMap data (ODbL), credited on every map.
+
+## Speech models (downloaded on demand, not redistributed)
+
+ToshLLM downloads speech checkpoints from their publishers when the user asks for one; the
+weights and their licences are not part of the app.
+
+| Model | Publisher | License |
+|---|---|---|
+| SenseVoice Small | FunAudioLLM | MIT |
+| Parakeet TDT 0.6B v3 | NVIDIA | CC-BY-4.0 |
+| Qwen3-ASR 0.6B / 1.7B and Qwen3 Forced Aligner 0.6B | Alibaba Qwen | Apache-2.0 |
+| CrisperWhisper 2.0 | nyralabs | Non-commercial research licence |
+
+CrisperWhisper 2.0 is offered for research and personal use only: its weights and its outputs
+may not be used commercially. Check the checkpoint's own licence before redistributing
+transcripts or using them at work.

@@ -10,16 +10,14 @@ struct AudioVADCalibration: Equatable, Sendable {
     let minSilenceDurationMS: Int
     let maxSpeechDurationSeconds: Double
     let speechPadMS: Int
-    let samplesOverlap: Double
 
-    var arguments: [String] {
+    var requestOptions: [(String, String)] {
         [
-            "--vad-threshold", String(threshold),
-            "--vad-min-speech-duration-ms", String(minSpeechDurationMS),
-            "--vad-min-silence-duration-ms", String(minSilenceDurationMS),
-            "--vad-max-speech-duration-s", String(maxSpeechDurationSeconds),
-            "--vad-speech-pad-ms", String(speechPadMS),
-            "--vad-samples-overlap", String(samplesOverlap)
+            ("threshold", String(threshold)),
+            ("min_speech_duration_ms", String(minSpeechDurationMS)),
+            ("min_silence_duration_ms", String(minSilenceDurationMS)),
+            ("max_speech_duration_sec", String(maxSpeechDurationSeconds)),
+            ("speech_pad_ms", String(speechPadMS))
         ]
     }
 
@@ -31,8 +29,7 @@ struct AudioVADCalibration: Equatable, Sendable {
             minSpeechDurationMS: Int(min(2_000, max(100, minSpeechDurationMS)).rounded()),
             minSilenceDurationMS: Int(min(2_000, max(50, minSilenceDurationMS)).rounded()),
             maxSpeechDurationSeconds: min(120, max(10, maxSpeechDurationSeconds)),
-            speechPadMS: Int(min(500, max(0, speechPadMS)).rounded()),
-            samplesOverlap: 0.1
+            speechPadMS: Int(min(500, max(0, speechPadMS)).rounded())
         )
     }
 }

@@ -42,9 +42,9 @@ enum SettingsKeys {
     static let serverBinary = "serverBinary"
     static let modelPath = "modelPath"
     static let modelsDir = "modelsDir"
-    static let whisperModel = "whisperModel"
+    static let speechModel = "speechModel"
     static let speechInputMethod = "speechInputMethod"
-    static let whisperLoadPolicy = "whisperLoadPolicy"
+    static let speechLoadPolicy = "speechLoadPolicy"
     static let audioOperation = "audioOperation"
     static let audioLanguage = "audioLanguage"
     static let audioTargetLanguage = "audioTargetLanguage"
@@ -290,7 +290,7 @@ enum SettingsKeys {
     /// live outside UserDefaults and are untouched.
     static let resettableOptionKeys = [
         serverBinary, port, ngl, ncmoe, ctx, contextAutomatic, threads, flashAttn, noMmap, jinja,
-        vramReserve, gpuIndex, gpuList, whisperModel, speechInputMethod, whisperLoadPolicy,
+        vramReserve, gpuIndex, gpuList, speechModel, speechInputMethod, speechLoadPolicy,
         audioOperation, audioLanguage, audioTargetLanguage, audioExportFormat,
         audioFollowTranscript, audioTranscriptMode, audioExportTrack,
         audioGlossary, audioTranslationModel, audioVADMode,

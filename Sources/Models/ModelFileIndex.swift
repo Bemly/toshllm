@@ -73,7 +73,7 @@ struct ModelFileIndex: Sendable {
     /// LLM discovery ignores ToshLLM's managed media folders, whose GGUF files
     /// are diffusion weights or conditioning encoders rather than chat models.
     var llmFiles: [URL] {
-        let mediaFolders: Set<String> = ["imagen", "image", "images", "video", "videos", "whisper"]
+        let mediaFolders: Set<String> = ["imagen", "image", "images", "video", "videos", "speech", "whisper"]
         return files.filter { file in
             guard let first = relativeComponents(of: file).first?.lowercased() else { return true }
             return !mediaFolders.contains(first)

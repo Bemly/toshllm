@@ -44,8 +44,8 @@ struct AudioVADCalibrationView: View {
                     }
                 }
                 .labelsHidden()
-                .help(loc.t("Desactiva VAD, usa los valores nativos de Whisper.cpp o aplica una calibración de ToshLLM.",
-                            "Disables VAD, uses Whisper.cpp native values, or applies a ToshLLM calibration."))
+                .help(loc.t("Desactiva VAD, usa los valores nativos de Silero en audio.cpp o aplica una calibración de ToshLLM.",
+                            "Disables VAD, uses Silero's native values in audio.cpp, or applies a ToshLLM calibration."))
             }
 
             Text(modeDescription)
@@ -58,8 +58,8 @@ struct AudioVADCalibrationView: View {
                         Text(profileName(item)).tag(item.rawValue)
                     }
                 }
-                .help(loc.t("Cambia cuánto debe parecerse una señal a voz antes de enviarla a Whisper.",
-                            "Changes how strongly a signal must resemble speech before it is sent to Whisper."))
+                .help(loc.t("Cambia cuánto debe parecerse una señal a voz antes de enviarla al modelo de voz.",
+                            "Changes how strongly a signal must resemble speech before it is sent to the speech model."))
 
                 Text(profileDescription)
                     .font(.caption)
@@ -94,11 +94,11 @@ struct AudioVADCalibrationView: View {
     private var modeDescription: String {
         switch mode {
         case .disabled:
-            loc.t("Whisper procesa el audio completo, incluidos los silencios.",
-                  "Whisper processes the complete audio, including silence.")
+            loc.t("El modelo de voz procesa el audio completo, incluidos los silencios.",
+                  "The speech model processes the complete audio, including silence.")
         case .standard:
-            loc.t("Silero VAD usa los valores predeterminados de Whisper.cpp, sin calibración añadida.",
-                  "Silero VAD uses Whisper.cpp defaults with no added calibration.")
+            loc.t("Silero VAD usa los valores predeterminados de audio.cpp, sin calibración añadida.",
+                  "Silero VAD uses audio.cpp defaults with no added calibration.")
         case .calibrated:
             loc.t("ToshLLM ajusta la sensibilidad y los cortes de voz con el perfil elegido.",
                   "ToshLLM adjusts speech sensitivity and segmentation with the selected profile.")
@@ -108,7 +108,7 @@ struct AudioVADCalibrationView: View {
     private func modeName(_ mode: AudioVADMode) -> String {
         switch mode {
         case .disabled: loc.t("Desactivado", "Disabled")
-        case .standard: loc.t("Predeterminado de Whisper", "Whisper default")
+        case .standard: loc.t("Predeterminado de audio.cpp", "audio.cpp default")
         case .calibrated: loc.t("Calibrado", "Calibrated")
         }
     }

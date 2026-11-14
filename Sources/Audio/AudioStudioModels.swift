@@ -6,7 +6,6 @@ import Foundation
 
 enum AudioStudioOperation: String, CaseIterable, Identifiable {
     case transcribe
-    case translateEnglish
     case translateLocal
 
     var id: String { rawValue }

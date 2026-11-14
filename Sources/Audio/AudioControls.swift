@@ -13,9 +13,9 @@ struct AudioControls: View {
     @EnvironmentObject private var control: ControlPanelState
     @Environment(\.openWindow) private var openWindow
 
-    @AppStorage(SettingsKeys.whisperModel) private var whisperModelID = WhisperModel.recommendedID
+    @AppStorage(SettingsKeys.speechModel) private var speechModelID = SpeechModel.recommendedID
     @AppStorage(SettingsKeys.gpuIndex) private var gpuIndex = -1
-    @AppStorage(SettingsKeys.whisperLoadPolicy) private var loadPolicyRaw = WhisperLoadPolicy.onDemand.rawValue
+    @AppStorage(SettingsKeys.speechLoadPolicy) private var loadPolicyRaw = SpeechLoadPolicy.onDemand.rawValue
     @AppStorage(SettingsKeys.audioOperation) private var operationRaw = AudioStudioOperation.transcribe.rawValue
     @AppStorage(SettingsKeys.audioLanguage) private var language = "auto"
     @AppStorage(SettingsKeys.audioTargetLanguage) private var targetLanguage = "Español"
@@ -30,7 +30,14 @@ struct AudioControls: View {
     @AppStorage(SettingsKeys.audioVADMode) private var vadModeRaw = AudioVADMode.defaultMode.rawValue
     @AppStorage(SettingsKeys.ncmoe) private var ncmoe = 0
 
-    private var model: WhisperModel { WhisperModel.model(id: whisperModelID) }
+    private var model: SpeechModel { SpeechModel.model(id: speechModelID) }
+
+    /// The picker's selection: a model that cannot detect the language (CrisperWhisper) offers
+    /// no "Automatic" entry, so the stored value is mapped to the language actually used.
+    private var spokenLanguage: Binding<String> {
+        Binding(get: { model.effectiveLanguage(language) },
+                set: { language = $0 })
+    }
     private var operation: AudioStudioOperation {
         AudioStudioOperation(rawValue: operationRaw) ?? .transcribe
     }
@@ -65,6 +72,10 @@ struct AudioControls: View {
         }
         .onChange(of: operationRaw) { _, _ in
             seedTargetLanguageIfNeeded()
+        }
+        .onChange(of: speechModelID, initial: true) { _, _ in
+            // A model that cannot detect the language (CrisperWhisper) needs a real one.
+            if !model.supports(language: language) { language = model.effectiveLanguage(language) }
         }
     }
 
@@ -104,24 +115,23 @@ struct AudioControls: View {
                     Text(loc.t("Operación", "Operation")).font(.caption).foregroundStyle(.secondary)
                     Picker("", selection: $operationRaw) {
                         Text(loc.t("Transcribir", "Transcribe")).tag(AudioStudioOperation.transcribe.rawValue)
-                        Text(loc.t("Traducir a inglés", "Translate to English")).tag(AudioStudioOperation.translateEnglish.rawValue)
                         Text(loc.t("Traducir con el chat", "Translate with chat")).tag(AudioStudioOperation.translateLocal.rawValue)
                     }
                     .labelsHidden()
-                    .help(loc.t("Whisper transcribe o traduce directamente al inglés; otros idiomas usan el modelo local del chat sin cambiar los tiempos.",
-                                "Whisper transcribes or translates directly to English; other languages use the local chat model without changing timestamps."))
+                    .help(loc.t("audio.cpp transcribe el audio; para traducir, el modelo local del chat traduce cada segmento sin cambiar los tiempos.",
+                                "audio.cpp transcribes the audio; to translate, the local chat model translates each segment without changing timestamps."))
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(loc.t("Idioma hablado", "Spoken language")).font(.caption).foregroundStyle(.secondary)
-                    Picker("", selection: $language) {
-                        ForEach(WhisperLanguage.common) { item in
+                    Picker("", selection: spokenLanguage) {
+                        ForEach(SpeechLanguage.common.filter { model.supports(language: $0.id) }) { item in
                             Text(loc.isSpanish ? item.es : item.en).tag(item.id)
                         }
                     }
                     .labelsHidden()
-                    .help(loc.t("Fijar el idioma mejora la precisión; Automático es útil cuando no lo conoces.",
-                                "Choosing the language improves accuracy; Automatic is useful when it is unknown."))
+                    .help(loc.t("Fijar el idioma mejora la precisión; Automático es útil cuando no lo conoces. Parakeet detecta el idioma por sí mismo y CrisperWhisper necesita que lo elijas.",
+                                "Choosing the language improves accuracy; Automatic is useful when it is unknown. Parakeet detects the language itself and CrisperWhisper needs you to pick one."))
                 }
 
                 if operation == .translateLocal {
@@ -156,12 +166,6 @@ struct AudioControls: View {
                         .lineLimit(2...5)
                         .help(loc.t("Fija nombres, marcas y términos, uno por línea, para mantenerlos iguales durante todo el vídeo.",
                                     "Pins names, brands and terminology, one per line, to keep them consistent throughout the video."))
-                } else if operation == .translateEnglish {
-                    Label(loc.t("La traducción integrada de Whisper siempre produce inglés.",
-                                "Whisper's built-in translation always produces English."),
-                          systemImage: "info.circle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -264,25 +268,29 @@ struct AudioControls: View {
     }
 
     private var modelCard: some View {
-        AudioSidebarSection(title: "Whisper.cpp · GPU", icon: "memorychip") {
+        AudioSidebarSection(title: "audio.cpp · GPU", icon: "memorychip") {
             VStack(alignment: .leading, spacing: 8) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(loc.t("Modelo", "Model")).font(.caption).foregroundStyle(.secondary)
-                    Picker("", selection: $whisperModelID) {
-                        ForEach(WhisperModel.catalog) { item in
+                    Picker("", selection: $speechModelID) {
+                        ForEach(SpeechModel.catalog) { item in
                             Text(verbatim: "\(item.name) · \(item.sizeMB) MB").tag(item.id)
                         }
                     }
                     .labelsHidden()
-                    .help(loc.t("Turbo ofrece el mejor equilibrio; Large v3 prioriza precisión.",
-                                "Turbo offers the best balance; Large v3 prioritizes accuracy."))
+                    .help(loc.t("Qwen3-ASR 1.7B prioriza precisión e idiomas; Parakeet es el más rápido en lenguas europeas.",
+                                "Qwen3-ASR 1.7B prioritizes accuracy and languages; Parakeet is the fastest for European languages."))
                 }
 
                 Text(loc.isSpanish ? model.detailES : model.detailEN)
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                if !models.whisperModelInstalled(model) {
+                if model.needsAligner {
+                    alignerControl
+                }
+
+                if !models.speechModelInstalled(model) {
                     downloadControl
                 } else {
                     Label(loc.t("Modelo instalado", "Model installed"), systemImage: "checkmark.circle.fill")
@@ -300,8 +308,8 @@ struct AudioControls: View {
                             Text(gpu.name).tag(index)
                         }
                     }
-                    .help(loc.t("Selecciona la GPU AMD que ejecutará Whisper.",
-                                "Select the AMD GPU that runs Whisper."))
+                    .help(loc.t("Selecciona la GPU AMD que ejecutará el modelo de voz.",
+                                "Select the AMD GPU that runs the speech model."))
                 }
             }
         }
@@ -310,42 +318,13 @@ struct AudioControls: View {
     @ViewBuilder
     private var vadControl: some View {
         AudioVADCalibrationView()
-        if vadMode.isEnabled && !models.whisperVADInstalled,
-           let download = models.whisperVADDownload() {
-            VStack(alignment: .leading, spacing: 5) {
-                ProgressView(value: download.progress)
-                if let error = download.error {
-                    Text(loc.half(error)).font(.caption).foregroundStyle(.red)
-                    Button(loc.t("Reintentar detector de voz", "Retry voice detector"),
-                           systemImage: "arrow.clockwise") {
-                        models.retryWhisperVADDownload(download)
-                    }
-                    .help(loc.t("Reinicia la descarga de Silero VAD.",
-                                "Restarts the Silero VAD download."))
-                } else if download.phase == .paused {
-                    Button(loc.t("Reanudar detector de voz", "Resume voice detector"),
-                           systemImage: "arrow.down.circle", action: download.resume)
-                        .help(loc.t("Continúa la descarga de Silero VAD.",
-                                    "Continues the Silero VAD download."))
-                } else {
-                    Text(loc.t("Descargando detector de voz…", "Downloading voice detector…"))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        } else if vadMode.isEnabled && !models.whisperVADInstalled {
-            VStack(alignment: .leading, spacing: 6) {
-                Label(loc.t("Audio necesita detectar silencios", "Audio needs silence detection"),
-                      systemImage: "waveform.badge.exclamationmark")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                Button(loc.t("Descargar Silero VAD · 864 KB", "Download Silero VAD · 864 KB"),
-                       systemImage: "arrow.down.circle.fill", action: models.downloadWhisperVAD)
-                    .help(loc.t("Descarga el detector que separa voz y silencio antes de ejecutar Whisper.",
-                                "Downloads the detector that separates speech and silence before running Whisper."))
-            }
-        }
-        if vadMode.isEnabled && models.whisperVADInstalled && studio.sourceURL != nil {
+        if vadMode.isEnabled && !SpeechEngine.vadInstalled {
+            Label(loc.t("Falta el detector de voz Silero; vuelve a instalar ToshLLM.",
+                        "The Silero voice detector is missing; reinstall ToshLLM."),
+                  systemImage: "waveform.badge.exclamationmark")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        } else if vadMode.isEnabled && studio.sourceURL != nil {
             Button(loc.t("Probar VAD en 30 segundos", "Preview VAD on 30 seconds"),
                    systemImage: "waveform.badge.magnifyingglass", action: previewVAD)
                 .disabled(studio.isBusy)
@@ -392,13 +371,13 @@ struct AudioControls: View {
 
     @ViewBuilder
     private var downloadControl: some View {
-        if let download = models.whisperDownload(model) {
+        if let download = models.speechDownload(model) {
             VStack(alignment: .leading, spacing: 5) {
                 ProgressView(value: download.progress)
                 if let error = download.error {
                     Text(loc.half(error)).font(.caption).foregroundStyle(.red)
                     Button(loc.t("Reintentar", "Retry"), systemImage: "arrow.clockwise") {
-                        models.retryWhisperDownload(download)
+                        models.retrySpeechDownload(download)
                     }
                     .help(loc.t("Reinicia la descarga del modelo.",
                                 "Restarts the model download."))
@@ -416,11 +395,61 @@ struct AudioControls: View {
         } else {
             Button(loc.t("Descargar %@", "Download %@", "\(model.name)"),
                    systemImage: "arrow.down.circle.fill") {
-                models.downloadWhisperModel(model)
+                models.downloadSpeechModel(model)
             }
             .glassButton(prominent: true)
-            .help(loc.t("Descarga el modelo en la carpeta local de modelos Whisper.",
-                        "Downloads the model into the local Whisper model folder."))
+            .help(loc.t("Descarga el modelo en la carpeta local de modelos de voz.",
+                        "Downloads the model into the local speech model folder."))
+        }
+    }
+
+    /// Qwen3-ASR times words only through the optional aligner checkpoint.
+    @ViewBuilder
+    private var alignerControl: some View {
+        if let aligner = model.aligner {
+            if models.speechAlignerInstalled(model) {
+                Label(loc.t("Tiempos por palabra activados", "Word timings on"),
+                      systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .help(loc.t("Los subtítulos respetan el inicio y el fin de cada palabra.",
+                                "Subtitles keep each word's start and end."))
+            } else if let download = models.speechAlignerDownload(model) {
+                VStack(alignment: .leading, spacing: 5) {
+                    ProgressView(value: download.progress)
+                    if let error = download.error {
+                        Text(loc.half(error)).font(.caption).foregroundStyle(.red)
+                        Button(loc.t("Reintentar", "Retry"), systemImage: "arrow.clockwise") {
+                            models.retrySpeechAlignerDownload(download)
+                        }
+                        .help(loc.t("Reinicia la descarga del alineador.",
+                                    "Restarts the aligner download."))
+                    } else if download.phase == .paused {
+                        Button(loc.t("Reanudar", "Resume"), systemImage: "arrow.down.circle",
+                               action: download.resume)
+                            .help(loc.t("Continúa la descarga desde donde se pausó.",
+                                        "Continues the download from where it paused."))
+                    } else {
+                        Text(loc.t("Descargando el alineador…", "Downloading the aligner…"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Button(loc.t("Añadir tiempos por palabra (%@ MB)", "Add word timings (%@ MB)",
+                                 "\(aligner.sizeMB)"),
+                           systemImage: "arrow.down.circle") {
+                        models.downloadSpeechAligner(model)
+                    }
+                    .help(loc.t("Descarga Qwen3 Forced Aligner, que marca el inicio y el fin de cada palabra. Sin él, los subtítulos se reparten dentro de cada tramo de voz.",
+                                "Downloads Qwen3 Forced Aligner, which marks each word's start and end. Without it, subtitles are spread across each speech segment."))
+                    Text(loc.t("Opcional · sin él, los subtítulos se reparten dentro de cada tramo de voz.",
+                               "Optional · without it, subtitles are spread across each speech segment."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -443,8 +472,8 @@ struct AudioControls: View {
                              server.state == .running ? "Stop both engines" : "Cancel"),
                        systemImage: "stop.fill", action: stopProcessing)
                     .frame(maxWidth: .infinity)
-                    .help(loc.t("Cancela el trabajo y libera Whisper; si el chat está activo, también lo detiene.",
-                                "Cancels the job and frees Whisper; if chat is active, it stops that too."))
+                    .help(loc.t("Cancela el trabajo y libera el modelo de voz; si el chat está activo, también lo detiene.",
+                                "Cancels the job and frees the speech model; if chat is active, it stops that too."))
             } else {
                 Button(action: startProcessing) {
                     Label(actionTitle, systemImage: operation == .transcribe ? "captions.bubble.fill" : "character.bubble.fill")
@@ -459,8 +488,8 @@ struct AudioControls: View {
                     Button(loc.t("Reintentar solo la traducción", "Retry translation only"),
                            systemImage: "arrow.triangle.2.circlepath", action: retryTranslation)
                         .disabled(!canRetryTranslation)
-                        .help(loc.t("Conserva la transcripción de Whisper y vuelve a ejecutar únicamente el Chat.",
-                                    "Keeps the Whisper transcript and runs only Chat again."))
+                        .help(loc.t("Conserva la transcripción y vuelve a ejecutar únicamente el Chat.",
+                                    "Keeps the transcript and runs only Chat again."))
                 }
             }
 
@@ -473,8 +502,8 @@ struct AudioControls: View {
     }
 
     private var canStart: Bool {
-        studio.sourceURL != nil && models.whisperModelInstalled(model)
-            && (!vadMode.isEnabled || models.whisperVADInstalled)
+        studio.sourceURL != nil && models.speechModelInstalled(model)
+            && (!vadMode.isEnabled || SpeechEngine.vadInstalled)
             && (operation != .translateLocal || canUseTranslationServer)
     }
 
@@ -490,7 +519,6 @@ struct AudioControls: View {
     private var actionTitle: String {
         switch operation {
         case .transcribe: loc.t("Crear subtítulos", "Create subtitles")
-        case .translateEnglish: loc.t("Transcribir y traducir", "Transcribe and translate")
         case .translateLocal: loc.t("Transcribir y traducir", "Transcribe and translate")
         }
     }
@@ -499,7 +527,7 @@ struct AudioControls: View {
         switch studio.stage {
         case .preparing: loc.t("Preparando el audio…", "Preparing audio…")
         case .analyzingVAD: loc.t("Analizando VAD…", "Analyzing VAD…")
-        case .transcribing: loc.t("Whisper está transcribiendo…", "Whisper is transcribing…")
+        case .transcribing: loc.t("audio.cpp está transcribiendo…", "audio.cpp is transcribing…")
         case .translating:
             loc.t("Traduciendo lote %@ de %@…", "Translating batch %@ of %@…", "\(studio.translatedBatchCount + 1)", "\(max(1, studio.translationBatchCount))")
         default: ""
@@ -532,11 +560,11 @@ struct AudioControls: View {
 
     private func startProcessing() {
         studio.start(
-            modelURL: model.url(in: models.whisperDirectory), vadModelURL: models.whisperVADURL,
+            model: model, modelURL: model.url(in: models.speechDirectory),
             vadConfiguration: AudioVADPreferences.configuration(), gpuIndex: gpuIndex,
             language: language, operation: operation, targetLanguage: targetLanguage,
             chatPort: port, routerModel: selectedTranslationModel, glossary: glossary,
-            restorePersistentModel: loadPolicyRaw == WhisperLoadPolicy.alwaysLoaded.rawValue && server.state == .running
+            restorePersistentModel: loadPolicyRaw == SpeechLoadPolicy.alwaysLoaded.rawValue && server.state == .running
         )
     }
 
@@ -617,12 +645,7 @@ struct AudioControls: View {
     }
 
     private func previewVAD() {
-        studio.previewVAD(
-            modelURL: model.url(in: models.whisperDirectory),
-            vadModelURL: models.whisperVADURL,
-            vadConfiguration: AudioVADPreferences.configuration(),
-            gpuIndex: gpuIndex, language: language
-        )
+        studio.previewVAD(vadConfiguration: AudioVADPreferences.configuration())
     }
 
     private func stopProcessing() {

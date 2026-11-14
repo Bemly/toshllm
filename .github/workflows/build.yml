@@ -142,8 +142,8 @@ jobs:
         run: |
           if [ ! -x vendor/llama.cpp/build-static/bin/llama-server ] || \
              [ ! -f vendor/llama.cpp/build-static/bin/default.metallib ] || \
-             [ ! -x vendor/whisper.cpp/build-static/bin/whisper-cli ] || \
-             [ ! -f vendor/whisper.cpp/build-static/bin/default.metallib ] || \
+             [ ! -x vendor/audio.cpp/build-static/bin/audiocpp_cli ] || \
+             [ ! -x vendor/audio.cpp/build-static/bin/audiocpp_server ] || \
              [ ! -x vendor/stable-diffusion.cpp/build-static/bin/sd-cli ] || \
              [ ! -f vendor/stable-diffusion.cpp/build-static/bin/default.metallib ]; then
             ARCH=x86_64 ./scripts/build-engines.sh

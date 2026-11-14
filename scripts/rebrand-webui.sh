@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds the llama.cpp web UI (MIT) from vendor, with ToshLLM's patches (patches/llama/ui),
+# Builds the llama.cpp web UI (MIT) from vendor, with ToshLLM's UI patch (patches/llama/0006-web-ui.patch),
 # and rebrands it into Assets/web-ui, served with --path. A built dist can be given instead.
 # Only user-visible strings change; wire identifiers and storage keys are left alone.
 # A substitution that stops matching is a hard error, not a silent pass-through.

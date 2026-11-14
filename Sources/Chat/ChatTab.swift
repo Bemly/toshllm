@@ -359,7 +359,7 @@ struct ChatMainView: View {
         case .chat: stateSubtitle
         case .images: loc.t("Imágenes · Experimental", "Images · Experimental")
         case .video: loc.t("Vídeo · Experimental", "Video · Experimental")
-        case .audio: loc.t("Audio · Whisper GPU", "Audio · Whisper GPU")
+        case .audio: loc.t("Audio · audio.cpp GPU", "Audio · audio.cpp GPU")
         }
     }
 }

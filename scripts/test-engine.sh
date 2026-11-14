@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Runs the engine's own tests (patches/llama/*/tests) against a built llama-server. They need no
+# Runs the engine's own tests (patches/llama-tests) against a built llama-server. They need no
 # model, network or credentials, only python3. Extra args go to unittest (e.g. -v, -k queued).
 # In GitHub Actions each suite's counts go to the job summary.
 #
@@ -21,8 +21,8 @@ not_run() {
 [ -x "$LLAMA_SERVER_BIN_PATH" ] || not_run "no llama-server at $LLAMA_SERVER_BIN_PATH; build it with ./scripts/build-engines.sh"
 "$LLAMA_SERVER_BIN_PATH" --version >/dev/null 2>&1 ||
     not_run "$LLAMA_SERVER_BIN_PATH does not run on this $(uname -m) computer; an x86_64 engine on Apple silicon needs Rosetta"
-suites=(patches/llama/*/tests/test_*.py(N))
-[ ${#suites} -gt 0 ] || not_run "no test suites under patches/llama/*/tests"
+suites=(patches/llama-tests/test_*.py(N))
+[ ${#suites} -gt 0 ] || not_run "no test suites under patches/llama-tests"
 
 {
     print -r -- "### Engine tests"

@@ -10,12 +10,16 @@ struct AudioVADConfiguration: Equatable, Sendable {
 
     var isEnabled: Bool { mode.isEnabled }
 
-    func arguments(modelURL: URL) -> [String] {
+    /// Silero leaves speech unbounded by default; each span becomes one ASR request, so the
+    /// standard mode caps it like the calibrated profiles do.
+    static let standardMaxSpeechSeconds = 30.0
+
+    /// `--request-option` pairs for the Silero VAD task, in a stable order.
+    var requestOptions: [(String, String)] {
         guard isEnabled else { return [] }
-        var result = ["--vad", "--vad-model", modelURL.path]
-        if mode == .calibrated, let calibration {
-            result.append(contentsOf: calibration.arguments)
+        guard mode == .calibrated, let calibration else {
+            return [("max_speech_duration_sec", String(Self.standardMaxSpeechSeconds))]
         }
-        return result
+        return calibration.requestOptions
     }
 }

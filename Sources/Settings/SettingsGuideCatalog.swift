@@ -38,8 +38,8 @@ extension SettingsDestination {
             ]
         case .speech:
             return [
-                .init(icon: "mic", title: loc.t("Entrada", "Input"), detail: loc.t("Elige dictado de Apple o Whisper.", "Choose Apple Dictation or Whisper.")),
-                .init(icon: "waveform", title: "Whisper.cpp", detail: loc.t("Transcripción acelerada por GPU.", "GPU-accelerated transcription.")),
+                .init(icon: "mic", title: loc.t("Entrada", "Input"), detail: loc.t("Elige dictado de Apple o audio.cpp.", "Choose Apple Dictation or audio.cpp.")),
+                .init(icon: "waveform", title: "audio.cpp", detail: loc.t("Transcripción acelerada por GPU.", "GPU-accelerated transcription.")),
                 .init(icon: "arrow.down.circle", title: loc.t("Carga", "Loading"), detail: loc.t("Bajo demanda o siempre disponible.", "On demand or always available.")),
                 .init(icon: "lock.shield", title: loc.t("Privacidad", "Privacy"), detail: loc.t("Audio y texto permanecen en tu Mac.", "Audio and text stay on your Mac."))
             ]
@@ -86,8 +86,8 @@ extension SettingsDestination {
         case .speech:
             return ("waveform",
                     loc.t("Voz local, control completo", "Local voice, full control"),
-                    loc.t("Configura la entrada de audio, la carga de Whisper y el perfil de transcripción.",
-                          "Configure audio input, Whisper loading, and the transcription profile."),
+                    loc.t("Configura la entrada de audio, la carga del modelo de voz y el perfil de transcripción.",
+                          "Configure audio input, speech model loading, and the transcription profile."),
                     loc.t("El audio y el texto permanecen en este Mac.",
                           "Audio and text stay on this Mac."))
         case .advanced:

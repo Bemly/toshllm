@@ -90,8 +90,8 @@ struct SubtitlePreview: View {
 
     private var emptyDescription: String {
         studio.isBusy
-            ? loc.t("Los segmentos aparecerán cuando Whisper termine.",
-                    "Segments will appear when Whisper finishes.")
+            ? loc.t("Los segmentos aparecerán cuando audio.cpp termine.",
+                    "Segments will appear when audio.cpp finishes.")
             : loc.t("Configura el resultado y pulsa Crear subtítulos.",
                     "Configure the result and press Create subtitles.")
     }
