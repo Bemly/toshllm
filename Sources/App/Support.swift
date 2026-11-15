@@ -541,6 +541,7 @@ enum ShellWords {
 enum EngineLock {
     private static var url: URL { AppSupport.directory.appendingPathComponent("engine.pid") }
     private static let engineMarker = AppInfo.name + ".app/Contents/Resources/bin"
+    private static let imageEngineMarker = AppInfo.name + ".app/Contents/Resources/bin-image"
 
     private static func read() -> [Int32] {
         (try? String(contentsOf: url, encoding: .utf8))?
@@ -581,7 +582,7 @@ enum EngineLock {
             let path = String(cString: buffer)
 
             // Only processes from our own bundle are ours to kill.
-            guard path.contains(engineMarker) else { continue }
+            guard path.contains(engineMarker) || path.contains(imageEngineMarker) else { continue }
 
             AppLog.app.warning("Reaping orphaned engine pid \(pid) at \(path)")
             kill(pid, SIGTERM)

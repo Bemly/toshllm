@@ -333,8 +333,8 @@ struct ImageControls: View {
                     }
                     .toggleStyle(.switch)
                     .controlSize(.mini)
-                    .help(loc.t("Arranca sd-server con la carpeta vision/ (WebUI + API). Comparte GPU con Generar: no lo uses a la vez en AMD.",
-                                "Starts sd-server on the vision/ folder (WebUI + API). Shares the GPU with Generate: don't run both at once on AMD."))
+                    .help(loc.t("Abre el servidor de imagen de Servers. Generar usa ese mismo proceso, así la caché de texto se conserva.",
+                                "Opens the Image server from Servers. Generate uses that same process, so the text cache stays warm."))
                     .onChange(of: imagenWebUI) { _, on in imageWebUI.setEnabled(on) }
 
                     if imagenWebUI {

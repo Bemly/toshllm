@@ -15,7 +15,7 @@ import SwiftUI
 }
 
 enum Section_: String, CaseIterable, Identifiable {
-    case dashboard, chat, models, benchmarks, docs, logs, chatSettings, settings, about
+    case dashboard, chat, models, benchmarks, docs, logs, chatSettings, settings, about, imageServer
     var id: String { rawValue }
     var icon: String {
         switch self {
@@ -28,6 +28,7 @@ enum Section_: String, CaseIterable, Identifiable {
         case .chatSettings: return "bubble.left.and.text.bubble.right"
         case .settings: return "slider.horizontal.3"
         case .about: return "info.circle"
+        case .imageServer: return "photo"
         }
     }
     func title(_ loc: Localizer) -> String {
@@ -41,6 +42,7 @@ enum Section_: String, CaseIterable, Identifiable {
         case .chatSettings: return loc.t("Ajustes del chat", "Chat Settings")
         case .settings: return loc.t("Ajustes", "Settings")
         case .about: return loc.t("Acerca de", "About")
+        case .imageServer: return loc.t("Servidor de imagen", "Image server")
         }
     }
 }
@@ -124,6 +126,7 @@ struct ControlPanelView: View {
         case .logs: return loc.t("Actividad y diagnóstico de los motores.", "Engine activity and diagnostics.")
         case .docs: return loc.t("Guías y referencia de ToshLLM.", "ToshLLM guides and reference.")
         case .about: return loc.t("IA local, hecha para tu Mac.", "Local AI, built for your Mac.")
+        case .imageServer: return loc.t("sd.cpp en caliente: la caché de texto evita recargar el codificador.", "Warm sd.cpp: a cached prompt skips the text encoder.")
         }
     }
 

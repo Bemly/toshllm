@@ -21,6 +21,7 @@ struct WorkspaceDestinationView: View {
             case .chatSettings: ChatSettingsView()
             case .settings: SettingsView()
             case .about: AboutView()
+            case .imageServer: ImageServerPane()
             }
         }
     }

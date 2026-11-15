@@ -900,7 +900,7 @@ final class ImageGenerator: ObservableObject {
     private(set) var lastBatch: [FinishedImageItem] = []
     private var pendingLatentURL: URL?
     private var pendingBatchCount = 1
-    private var pendingOutputPattern: String?
+    var pendingOutputPattern: String?
     private var pendingLatentPattern: String?
     private var pendingBaseSeed = -1
     private var pendingFullSteps: Int?
@@ -916,16 +916,18 @@ final class ImageGenerator: ObservableObject {
     }
 
     private var process: Process?
+    var runTask: Task<Void, Never>?
+    var activeJobID: String?
     private var startedAt: Date?
-    private var firstStepAt: Date?
+    var firstStepAt: Date?
     private var previewURL: URL?
     private var previewTimer: Timer?
     private var previewSeenAt: Date?
     /// Tail of the engine output, kept so a failure can be diagnosed (e.g. a GPU
     /// watchdog timeout) into a helpful message.
-    private var logTail = ""
+    var logTail = ""
     /// Persist the engine output so the Logs tab can show image runs too.
-    private let fileLog = RotatingFileLog(name: "imagegen")
+    let fileLog = RotatingFileLog(name: "imagegen")
 
     /// Newest image-gen log file, for the Logs tab to read (this generator lives in
     /// another window, so the file is the shared handoff).
@@ -975,6 +977,10 @@ final class ImageGenerator: ObservableObject {
     func cancel() {
         process?.terminate()
         process = nil
+        runTask?.cancel()
+        if let id = activeJobID {
+            Task { await ImageWebUIServer.shared.cancelJob(id) }
+        }
         if isBusy { state = .idle }
     }
 
@@ -1264,24 +1270,8 @@ final class ImageGenerator: ObservableObject {
             env["GGML_METAL_SHARED_BUFFERS_DISABLE"] = "1"
         }
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: Self.binary)
-        p.arguments = args
-        p.environment = env
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let data = h.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in self?.consume(text, steps: steps) }
-        }
-        p.terminationHandler = { [weak self] proc in
-            Task { @MainActor in self?.finish(status: proc.terminationStatus, output: out) }
-        }
-
         fileLog.startSession()
-        fileLog.append("$ sd-cli " + args.joined(separator: " ") + "\n\n")
+        fileLog.append("$ sd-server " + args.joined(separator: " ") + "\n\n")
 
         resultImage = nil
         resultURL = nil
@@ -1292,12 +1282,8 @@ final class ImageGenerator: ObservableObject {
         state = .generating
         startedAt = Date()
         firstStepAt = nil
-        do {
-            try p.run()
-            process = p
-            startPreviewWatch()
-        } catch {
-            state = .failed(error.localizedDescription)
+        runTask = Task { [weak self] in
+            await self?.runOnServer(args: args, env: env, output: out, steps: steps)
         }
     }
 
@@ -1329,7 +1315,7 @@ final class ImageGenerator: ObservableObject {
     /// Parse the engine's per-step progress. Only the sampler prints a line ending
     /// in `- X.Xs/it`; other `N/M` output (image count, saved files) must not move
     /// the bar. Also note the decode stage so the UI can name the wait.
-    private func consume(_ text: String, steps: Int) {
+    func consume(_ text: String, steps: Int) {
         logTail = String((logTail + text).suffix(4000))
         fileLog.append(text)
         for raw in text.split(whereSeparator: \.isNewline) {
@@ -1347,7 +1333,7 @@ final class ImageGenerator: ObservableObject {
         }
     }
 
-    private func finish(status: Int32, output: URL) {
+    func finish(status: Int32, output: URL) {
         process = nil
         previewTimer?.invalidate()
         previewTimer = nil

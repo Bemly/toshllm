@@ -34,6 +34,7 @@ struct WorkspaceSidebar: View {
                     ForEach(manager.servers, id: \.id) { server in
                         SidebarServerRow(server: server)
                     }
+                    ImageServerSidebarRow()
                     Button {
                         let server = manager.addServer(name: loc.t("Servidor %@", "Server %@", "\(manager.servers.count + 1)"), from: nil)
                         animate { control.focusServer(server.id) }
