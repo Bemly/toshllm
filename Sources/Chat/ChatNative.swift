@@ -3616,7 +3616,6 @@ struct NativeChatView: View {
                 inputFocused = true
             case .explore:
                 control.openSettings(.chat)
-                openWindow(id: "control")
             }
         }
     }
@@ -4143,7 +4142,6 @@ struct NativeChatView: View {
             Button {
                 showSystem = false
                 control.openSettings(.chat)
-                openWindow(id: "control")
             } label: {
                 Label(loc.t("Abrir ajustes avanzados del chat…", "Open advanced chat settings…"),
                       systemImage: "gearshape.2")

@@ -93,6 +93,11 @@ struct WorkspaceSidebar: View {
     }
 
     private func navigate(to section: Section_) {
+        if section == .settings || section == .chatSettings {
+            control.showSettingsInMain(section)
+            openWindow(id: "chat")
+            return
+        }
         animate {
             control.serverAnchor = nil
             control.section = section

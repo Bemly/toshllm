@@ -28,17 +28,31 @@ final class ControlPanelState: ObservableObject {
     }
 
     func openSettings(_ anchor: SettingsAnchor) {
-        settingsAnchor = anchor
-        section = anchor == .chat ? .chatSettings : .settings
+        showSettingsInMain(anchor == .chat ? .chatSettings : .settings)
     }
+
+    /// Switch the main window to the Settings tab (chat or engine settings).
+    func showSettingsInMain(_ section: Section_ = .settings) {
+        let pane: Section_ = (section == .chatSettings) ? .chatSettings : .settings
+        settingsAnchor = pane == .chatSettings ? .chat : nil
+        settingsSection = pane
+        self.section = pane
+        pendingMainMode = .settings
+        mainSettingsTicket = UUID()
+    }
+
+    /// When set, ChatMainView switches to this mode (Settings tab, etc.).
+    @Published var pendingMainMode: MainMode?
+    @Published var settingsSection: Section_ = .settings
+    @Published var mainSettingsTicket = UUID()
 }
 
 enum SettingsAnchor: Hashable {
     case chat
 }
 
-/// Top-level mode of the main window: the chat, or the image studio.
-enum MainMode: String { case chat, images, video, audio }
+/// Top-level mode of the main window: chat, studios, or settings.
+enum MainMode: String { case chat, images, video, audio, settings }
 
 struct ChatMainView: View {
     @EnvironmentObject var server: ServerController
@@ -72,6 +86,8 @@ struct ChatMainView: View {
                     VideoControls(pool: videoGenPool).transition(.opacity)
                 } else if mode == .audio {
                     AudioControls(studio: audioStudio).transition(.opacity)
+                } else if mode == .settings {
+                    settingsSidebar.transition(.opacity)
                 } else {
                     ConversationListView().transition(.opacity)
                 }
@@ -84,6 +100,8 @@ struct ChatMainView: View {
                     VideoCanvas(pool: videoGenPool).transition(.opacity)
                 } else if mode == .audio {
                     AudioCanvas(studio: audioStudio).transition(.opacity)
+                } else if mode == .settings {
+                    settingsDetail.transition(.opacity)
                 } else {
                     chatDetail.transition(.opacity)
                 }
@@ -136,6 +154,10 @@ struct ChatMainView: View {
             if !onboardingDone && models.models.isEmpty {
                 showOnboarding = true
             }
+            applyPendingMainMode()
+        }
+        .onChange(of: control.mainSettingsTicket) { _, _ in
+            applyPendingMainMode()
         }
         .sheet(isPresented: $showOnboarding) {
             OnboardingSheet {
@@ -158,6 +180,42 @@ struct ChatMainView: View {
 
     private var chatDetail: some View {
         NativeChatView()
+    }
+
+    private var settingsSidebar: some View {
+        List(selection: Binding(
+            get: { control.settingsSection },
+            set: { control.settingsSection = $0 }
+        )) {
+            Section {
+                Label(Section_.chatSettings.title(loc), systemImage: Section_.chatSettings.icon)
+                    .tag(Section_.chatSettings)
+                Label(Section_.settings.title(loc), systemImage: Section_.settings.icon)
+                    .tag(Section_.settings)
+            } header: {
+                Text(loc.t("Ajustes", "Settings"))
+            }
+        }
+        .listStyle(.sidebar)
+    }
+
+    private var settingsDetail: some View {
+        Group {
+            switch control.settingsSection {
+            case .chatSettings:
+                ChatSettingsView()
+            default:
+                SettingsView()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(WorkspaceStyle.canvas)
+    }
+
+    private func applyPendingMainMode() {
+        guard let pending = control.pendingMainMode else { return }
+        mode = pending
+        control.pendingMainMode = nil
     }
 
     private var windowBackdropColor: Color {
@@ -193,21 +251,35 @@ struct ChatMainView: View {
         }
     }
 
-    /// Chat / Images switch, front and center in the title bar.
+    /// Chat / studios / Settings switch, front and center in the title bar.
     private var modePicker: some View {
         HStack(spacing: 14) {
             modeButton(.chat, title: loc.t("Chat", "Chat"), icon: "bubble.left.and.bubble.right")
             modeButton(.images, title: loc.t("Imágenes", "Images"), icon: "photo.on.rectangle.angled")
             modeButton(.video, title: loc.t("Vídeo", "Video"), icon: "play.circle")
             modeButton(.audio, title: "Audio", icon: "waveform")
+            modeButton(.settings, title: loc.t("Ajustes", "Settings"), icon: "gearshape")
         }
         .fixedSize()
-        .help(loc.t("Cambia entre chat, imágenes, vídeo y audio.",
-                    "Switch between chat, images, video, and audio."))
+        .help(loc.t("Cambia entre chat, imágenes, vídeo, audio y ajustes.",
+                    "Switch between chat, images, video, audio, and settings."))
+        .background {
+            Button("") {
+                control.settingsSection = .settings
+                mode = .settings
+            }
+            .keyboardShortcut(",", modifiers: .command)
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
     }
 
     private func modeButton(_ value: MainMode, title: String, icon: String) -> some View {
         Button {
+            if value == .settings, control.settingsSection != .chatSettings,
+               control.settingsSection != .settings {
+                control.settingsSection = .settings
+            }
             mode = value
         } label: {
             Label(title, systemImage: icon)
@@ -241,16 +313,15 @@ struct ChatMainView: View {
                 .buttonStyle(GlassIconButtonStyle())
                 .disabled(mode != .chat)
             Button {
-                openControl()
+                openControl(.dashboard)
             } label: {
-                Label(loc.t("Configuración", "Configuration"), systemImage: "gearshape")
+                Label(loc.t("Configuración", "Configuration"), systemImage: "house")
                     .labelStyle(.iconOnly)
             }
-                .buttonStyle(GlassIconButtonStyle())
-                .keyboardShortcut(",", modifiers: .command)
-                .accessibilityLabel(loc.t("Configuración", "Configuration"))
-                .help(loc.t("Configuración: modelos, motor, benchmarks y ajustes (⌘,)",
-                            "Configuration: models, engine, benchmarks and settings (⌘,)"))
+            .buttonStyle(GlassIconButtonStyle())
+            .accessibilityLabel(loc.t("Configuración", "Configuration"))
+            .help(loc.t("Panel de control: modelos, motor y benchmarks",
+                        "Control panel: models, engine, and benchmarks"))
         }
     }
 
@@ -324,7 +395,8 @@ struct ChatMainView: View {
                                 "Switch models or download more."))
                 }
                 Button {
-                    openControl(.settings)
+                    control.settingsSection = .settings
+                    mode = .settings
                 } label: {
                     Label(loc.t("Ajustes", "Settings"), systemImage: "slider.horizontal.3")
                 }
@@ -360,6 +432,7 @@ struct ChatMainView: View {
         case .images: loc.t("Imágenes · Experimental", "Images · Experimental")
         case .video: loc.t("Vídeo · Experimental", "Video · Experimental")
         case .audio: loc.t("Audio · audio.cpp GPU", "Audio · audio.cpp GPU")
+        case .settings: loc.t("Ajustes", "Settings")
         }
     }
 }
