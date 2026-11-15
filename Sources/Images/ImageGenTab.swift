@@ -1030,14 +1030,11 @@ private struct ImageDraftControlExtras: View {
                     .onChange(of: cfg.draftCount) { _, v in cfg.draftCount = min(16, max(1, v)) }
             }
             row(loc.t("Pasos borrador", "Draft steps"),
-                loc.t("Hasta qué paso del horario completo (S) llega el borrador. Generar empieza en 0; Continuar avanza desde el latente hasta este número. Pon S para acabarlo como producto.",
-                      "How far into the full schedule (S) the sketch goes. Generate starts at 0; Continue advances the latent to this number. Set it to S to finish as a product.")) {
+                loc.t("Hasta qué paso del horario completo (S) llega el borrador. Generar necesita D < S; Continuar puede ir a D > actual, o a S para acabarlo como producto.",
+                      "How far into the full schedule (S) the sketch goes. Generate needs D < S; Continue can go to D above the current step, or to S to finish as a product.")) {
                 TextField("", value: $cfg.draftSteps, format: .number.grouping(.never))
                     .workspaceTextField().frame(width: 96)
-                    .onChange(of: cfg.draftSteps) { _, v in
-                        let maxS = model.steps(cfg.steps)
-                        cfg.draftSteps = min(maxS, max(1, v))
-                    }
+                    .onChange(of: cfg.draftSteps) { _, v in if v < 1 { cfg.draftSteps = 1 } }
             }
             Button {
                 pool.enqueueDraftBatch(for: cfg)
@@ -1050,8 +1047,8 @@ private struct ImageDraftControlExtras: View {
             .controlSize(.small)
             .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed
                       || !model.sigmas.isEmpty || cfg.draftSteps >= model.steps(cfg.steps))
-            .help(loc.t("Encola borradores 0…D con latente. La vista previa es una estimación limpia; el latente ruidoso sirve para Continuar. No usa la imagen inicial.",
-                        "Queues drafts 0…D with a latent. The preview is a clean estimate; the noisy latent is for Continue. The init image is not used."))
+            .help(loc.t("Una sola corrida: el TE se codifica una vez y MOSS muestrea cada semilla. Vista previa limpia; latente ruidoso para Continuar. No usa la imagen inicial.",
+                        "One run: TE encodes once, then MOSS samples each seed. Clean preview; noisy latent for Continue. The init image is not used."))
         }
         .padding(.top, 4)
     }

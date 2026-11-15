@@ -896,7 +896,24 @@ final class ImageGenerator: ObservableObject {
     private(set) var lastLatentURL: URL?
     private(set) var lastFullSteps: Int?
     private(set) var lastEndedAtStep: Int?
+    /// Multi-seed draft batch from one TE encode; empty for a single-image run.
+    private(set) var lastBatch: [FinishedImageItem] = []
     private var pendingLatentURL: URL?
+    private var pendingBatchCount = 1
+    private var pendingOutputPattern: String?
+    private var pendingLatentPattern: String?
+    private var pendingBaseSeed = -1
+    private var pendingFullSteps: Int?
+    private var pendingEndedAtStep: Int?
+
+    struct FinishedImageItem {
+        let url: URL
+        let image: NSImage
+        let seed: Int
+        let latentURL: URL?
+        let fullSteps: Int?
+        let endedAtStep: Int?
+    }
 
     private var process: Process?
     private var startedAt: Date?
@@ -1005,7 +1022,8 @@ final class ImageGenerator: ObservableObject {
                   controlNetPath: String = "", controlImagePath: String = "",
                   controlStrength: Double = 0.9,
                   controlType: ImageControlType = .auto,
-                  handoff: ImageLatentHandoff? = nil) {
+                  handoff: ImageLatentHandoff? = nil,
+                  batchCount: Int = 1) {
         guard !isBusy else { return }
         let steps = model.steps(steps)
         let cfg = cfgScale ?? model.cfgScale
@@ -1018,13 +1036,18 @@ final class ImageGenerator: ObservableObject {
             return
         }
         lastPrompt = prompt; lastSeed = seed; lastWidth = width; lastHeight = height
+        lastBatch = []
         let dir = models.imagenDirectory
         // Timestamp plus a short token: a batch fired in the same second (one run
         // per instance) would otherwise share a name and overwrite a single file.
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd_HH.mm.ss"
         let token = String(UUID().uuidString.prefix(4)).lowercased()
-        let out = dir.appendingPathComponent("toshllm_\(fmt.string(from: Date()))_\(token).\(format.ext)")
+        let batchN = max(1, min(batchCount, 16))
+        // %d so one TE encode can write many seeds without clobbering files.
+        let out = batchN > 1
+            ? dir.appendingPathComponent("toshllm_\(fmt.string(from: Date()))_\(token)_%d.\(format.ext)")
+            : dir.appendingPathComponent("toshllm_\(fmt.string(from: Date()))_\(token).\(format.ext)")
 
         // Each component maps to its own sd-cli flag (a full checkpoint via --model,
         // or a diffusion model plus its VAE and text encoders).
@@ -1164,9 +1187,18 @@ final class ImageGenerator: ObservableObject {
             args.append("--offload-to-cpu")
         }
         pendingLatentURL = nil
+        pendingBatchCount = batchN
+        pendingOutputPattern = batchN > 1 ? out.path : nil
+        pendingLatentPattern = nil
+        pendingBaseSeed = seed
+        pendingFullSteps = nil
+        pendingEndedAtStep = nil
         lastLatentURL = nil
         lastFullSteps = nil
         lastEndedAtStep = nil
+        if batchN > 1 {
+            args += ["--batch-count", String(batchN), "--output-begin-idx", "0"]
+        }
         if let handoff {
             args += ["--start-at-step", String(handoff.startAtStep),
                      "--end-at-step", String(handoff.endAtStep),
@@ -1175,15 +1207,27 @@ final class ImageGenerator: ObservableObject {
                 args += ["--latent-in", handoff.latentInPath]
             }
             if handoff.writeLatent {
-                let latent = out.deletingPathExtension().appendingPathExtension("sdlt")
-                args += ["--latent-out", latent.path]
-                let sidecar = URL(fileURLWithPath: latent.path + ".json")
-                if let data = try? JSONEncoder().encode(handoff) {
-                    try? data.write(to: sidecar)
-                    pendingLatentURL = latent
-                    lastLatentURL = latent
-                    lastFullSteps = handoff.fullSteps
-                    lastEndedAtStep = handoff.endedAtStep
+                let latentPattern = out.deletingPathExtension().appendingPathExtension("sdlt")
+                args += ["--latent-out", latentPattern.path]
+                pendingLatentPattern = batchN > 1 ? latentPattern.path : nil
+                pendingFullSteps = handoff.fullSteps
+                pendingEndedAtStep = handoff.endedAtStep
+                lastFullSteps = handoff.fullSteps
+                lastEndedAtStep = handoff.endedAtStep
+                for i in 0..<batchN {
+                    var meta = handoff
+                    meta.seed = seed + i
+                    let latentPath = batchN > 1
+                        ? String(format: latentPattern.path, i)
+                        : latentPattern.path
+                    let latentURL = URL(fileURLWithPath: latentPath)
+                    if let data = try? JSONEncoder().encode(meta) {
+                        try? data.write(to: URL(fileURLWithPath: latentPath + ".json"))
+                    }
+                    if i == 0 {
+                        pendingLatentURL = latentURL
+                        lastLatentURL = latentURL
+                    }
                 }
             }
         }
@@ -1310,26 +1354,65 @@ final class ImageGenerator: ObservableObject {
         if let p = previewURL { try? FileManager.default.removeItem(at: p) }
         previewImage = nil
         defer { onFinish?() }
-        guard status == 0, let img = NSImage(contentsOf: output) else {
-            if let latent = pendingLatentURL {
+
+        func cleanupPendingLatents() {
+            let n = max(1, pendingBatchCount)
+            if let pattern = pendingLatentPattern {
+                for i in 0..<n {
+                    let path = String(format: pattern, i)
+                    try? FileManager.default.removeItem(atPath: path)
+                    try? FileManager.default.removeItem(atPath: path + ".json")
+                }
+            } else if let latent = pendingLatentURL {
                 try? FileManager.default.removeItem(at: latent)
                 try? FileManager.default.removeItem(at: URL(fileURLWithPath: latent.path + ".json"))
-                pendingLatentURL = nil
-                lastLatentURL = nil
-                lastFullSteps = nil
-                lastEndedAtStep = nil
             }
+            pendingLatentURL = nil
+            pendingLatentPattern = nil
+            lastLatentURL = nil
+            lastFullSteps = nil
+            lastEndedAtStep = nil
+            lastBatch = []
+        }
+
+        if status != 0 {
+            cleanupPendingLatents()
             // 15/SIGTERM and 2/SIGINT are user cancels, not errors.
             if status == 15 || status == 2 { state = .failed(""); return }
-            // Map the two size-related failures to actionable messages instead of a
-            // raw exit code: VRAM exhaustion and the GPU watchdog timeout.
             if logTail.contains("failed to allocate") { state = .failed("OOM"); return }
             let timedOut = logTail.contains("Timeout") || logTail.contains("status 5")
             state = .failed(timedOut ? "TIMEOUT" : "exit \(status)")
             return
         }
-        resultImage = img
-        resultURL = output
+
+        let n = max(1, pendingBatchCount)
+        var items: [FinishedImageItem] = []
+        for i in 0..<n {
+            let path = pendingOutputPattern.map { String(format: $0, i) } ?? output.path
+            let url = URL(fileURLWithPath: path)
+            guard let img = NSImage(contentsOf: url) else { continue }
+            let latentPath = pendingLatentPattern.map { String(format: $0, i) }
+                ?? pendingLatentURL?.path
+            let latentURL = latentPath.flatMap {
+                FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil
+            }
+            items.append(FinishedImageItem(
+                url: url, image: img, seed: pendingBaseSeed >= 0 ? pendingBaseSeed + i : lastSeed,
+                latentURL: latentURL, fullSteps: pendingFullSteps, endedAtStep: pendingEndedAtStep))
+        }
+        guard let first = items.first else {
+            cleanupPendingLatents()
+            state = .failed("exit \(status)")
+            return
+        }
+        lastBatch = items
+        // Canvas shows the first draft; the gallery gets every seed.
+        resultImage = first.image
+        resultURL = first.url
+        lastSeed = first.seed
+        lastLatentURL = first.latentURL
+        lastFullSteps = first.fullSteps
+        lastEndedAtStep = first.endedAtStep
         progress = 1
         lastDuration = elapsed
         state = .done
@@ -1539,6 +1622,8 @@ struct QueuedPrompt: Identifiable, Equatable {
     var initImagePath: String? = nil
     /// Set for a draft or a draft Continue. Nil keeps the original full-schedule run.
     var handoff: ImageLatentHandoff? = nil
+    /// Seeds seed..<seed+batchCount in one sd-cli run (one TE encode).
+    var batchCount: Int = 1
 }
 
 /// A finished image kept in the session gallery, with the inputs that made it.
@@ -1693,17 +1778,17 @@ final class ImageGenPool: ObservableObject {
 
     func enqueue(_ text: String, seed: Int = -1, steps: Int? = nil,
                  targetInstanceID: UUID? = nil, initImagePath: String? = nil,
-                 handoff: ImageLatentHandoff? = nil) {
+                 handoff: ImageLatentHandoff? = nil, batchCount: Int = 1) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         let img = handoff == nil && initImagePath?.isEmpty == false ? initImagePath : nil
         queue.append(QueuedPrompt(text: t, seed: seed, steps: steps,
                                   targetInstanceID: targetInstanceID, initImagePath: img,
-                                  handoff: handoff))
+                                  handoff: handoff, batchCount: max(1, min(batchCount, 16))))
         if queueActive { pump() }
     }
 
-    /// Drafts sample 0…D of the full S-step schedule and keep the leftover latent.
+    /// One sd-cli run: TE encodes once, then MOSS samples N seeds on 0…D of S.
     func enqueueDraftBatch(for c: ImageInstanceConfig) {
         let prompt = effectivePrompt(for: c)
         guard !prompt.isEmpty else { return }
@@ -1716,17 +1801,17 @@ final class ImageGenPool: ObservableObject {
         let n = max(1, min(c.draftCount, 16))
         let (w, h) = c.dimensions
         let negative = effectiveNegativePrompt(for: c)
-        for _ in 0..<n {
-            let seed = Int.random(in: 0..<Int(Int32.max))
-            let handoff = ImageLatentHandoff(
-                startAtStep: 0, endAtStep: draft, addNoise: true, latentInPath: "",
-                writeLatent: true, fullSteps: full, endedAtStep: draft, seed: seed,
-                sampler: c.samplingMethod, scheduler: c.scheduler, flowShift: c.flowShift,
-                cfgScale: c.effectiveCfg(for: model), modelID: model.name,
-                textEncoder: c.mossTextEncoder, width: w, height: h,
-                prompt: prompt, negativePrompt: negative)
-            enqueue(prompt, seed: seed, steps: full, targetInstanceID: c.id, handoff: handoff)
-        }
+        // Leave room so seed+i stays inside Int32 for the engine.
+        let seed = Int.random(in: 0..<(Int(Int32.max) - n))
+        let handoff = ImageLatentHandoff(
+            startAtStep: 0, endAtStep: draft, addNoise: true, latentInPath: "",
+            writeLatent: true, fullSteps: full, endedAtStep: draft, seed: seed,
+            sampler: c.samplingMethod, scheduler: c.scheduler, flowShift: c.flowShift,
+            cfgScale: c.effectiveCfg(for: model), modelID: model.name,
+            textEncoder: c.mossTextEncoder, width: w, height: h,
+            prompt: prompt, negativePrompt: negative)
+        enqueue(prompt, seed: seed, steps: full, targetInstanceID: c.id,
+                handoff: handoff, batchCount: n)
         startQueue()
     }
 
@@ -1788,7 +1873,8 @@ final class ImageGenPool: ObservableObject {
     func launchGenerate(_ c: ImageInstanceConfig, models: ModelStore,
                         prompt: String, steps: Int, seed: Int,
                         initImagePath: String? = nil,
-                        handoff: ImageLatentHandoff? = nil) {
+                        handoff: ImageLatentHandoff? = nil,
+                        batchCount: Int = 1) {
         let model = c.resolvedModel(for: hardware)
         let (w, h) = c.dimensions
         generator(for: c.id).generate(
@@ -1807,7 +1893,7 @@ final class ImageGenPool: ObservableObject {
             slgLayers: c.slgLayers,
             controlNetPath: c.controlNetPath, controlImagePath: c.controlImagePath,
             controlStrength: c.controlStrength, controlType: c.controlTypeValue,
-            handoff: handoff)
+            handoff: handoff, batchCount: batchCount)
     }
 
     func removeFromQueue(_ id: UUID) { queue.removeAll { $0.id == id } }
@@ -1818,14 +1904,27 @@ final class ImageGenPool: ObservableObject {
     /// Append a generator's finished result to the session gallery (newest first),
     /// so every render stays visible even as instances move on to the next prompt.
     private func recordResult(from gen: ImageGenerator, instanceID: UUID) {
-        guard let url = gen.resultURL, let img = gen.resultImage, gallery.first?.url != url else { return }
-        let latent = gen.lastLatentURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
-        gallery.insert(GeneratedImage(url: url, image: img, prompt: gen.lastPrompt, seed: gen.lastSeed,
-                                      width: gen.lastWidth, height: gen.lastHeight, duration: gen.lastDuration,
-                                      instanceLabel: instanceLabel(for: instanceID),
-                                      latentURL: latent, fullSteps: gen.lastFullSteps,
-                                      endedAtStep: gen.lastEndedAtStep), at: 0)
-        if gallery.count > 60 { gallery.removeLast() }
+        let label = instanceLabel(for: instanceID)
+        let items: [ImageGenerator.FinishedImageItem]
+        if !gen.lastBatch.isEmpty {
+            items = gen.lastBatch
+        } else if let url = gen.resultURL, let img = gen.resultImage {
+            let latent = gen.lastLatentURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+            items = [.init(url: url, image: img, seed: gen.lastSeed, latentURL: latent,
+                           fullSteps: gen.lastFullSteps, endedAtStep: gen.lastEndedAtStep)]
+        } else {
+            return
+        }
+        // Insert last→first so the first seed lands at the top of a newest-first gallery.
+        for item in items.reversed() {
+            if gallery.first?.url == item.url { continue }
+            gallery.insert(GeneratedImage(url: item.url, image: item.image, prompt: gen.lastPrompt,
+                                          seed: item.seed, width: gen.lastWidth, height: gen.lastHeight,
+                                          duration: gen.lastDuration, instanceLabel: label,
+                                          latentURL: item.latentURL, fullSteps: item.fullSteps,
+                                          endedAtStep: item.endedAtStep), at: 0)
+        }
+        while gallery.count > 60 { gallery.removeLast() }
     }
 
     /// True when `job` may run on `c`: untargeted, targeted at `c`, or its target
@@ -1860,7 +1959,8 @@ final class ImageGenPool: ObservableObject {
             if let aux { busyGPUs.insert(aux) }
             launchGenerate(c, models: models, prompt: job.text,
                            steps: job.steps ?? c.steps, seed: job.seed,
-                           initImagePath: job.initImagePath, handoff: job.handoff)
+                           initImagePath: job.initImagePath, handoff: job.handoff,
+                           batchCount: job.batchCount)
         }
         if queue.isEmpty && !anyBusy { queueActive = false }
     }
