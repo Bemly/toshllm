@@ -28,15 +28,22 @@ final class ControlPanelState: ObservableObject {
     }
 
     func openSettings(_ anchor: SettingsAnchor) {
-        showSettingsInMain(anchor == .chat ? .chatSettings : .settings)
+        showControlInMain(anchor == .chat ? .chatSettings : .settings)
     }
 
-    /// Switch the main window to the Settings tab (chat or engine settings).
+    /// Switch the main window to the Settings tab (full configuration UI, no extra window).
     func showSettingsInMain(_ section: Section_ = .settings) {
-        let pane: Section_ = (section == .chatSettings) ? .chatSettings : .settings
-        settingsAnchor = pane == .chatSettings ? .chat : nil
-        settingsSection = pane
-        self.section = pane
+        showControlInMain(section)
+    }
+
+    /// Land on any Configuration section inside the main window Settings tab.
+    func showControlInMain(_ section: Section_ = .dashboard) {
+        if section != .dashboard { serverAnchor = nil }
+        self.section = section
+        if section == .chatSettings || section == .settings {
+            settingsSection = section
+            settingsAnchor = section == .chatSettings ? .chat : nil
+        }
         pendingMainMode = .settings
         mainSettingsTicket = UUID()
     }
@@ -87,7 +94,10 @@ struct ChatMainView: View {
                 } else if mode == .audio {
                     AudioControls(studio: audioStudio).transition(.opacity)
                 } else if mode == .settings {
-                    settingsSidebar.transition(.opacity)
+                    WorkspaceSidebar(embeddedInMain: true) {
+                        withAnimation(.easeInOut(duration: 0.2)) { mode = .chat }
+                    }
+                    .transition(.opacity)
                 } else {
                     ConversationListView().transition(.opacity)
                 }
@@ -101,7 +111,7 @@ struct ChatMainView: View {
                 } else if mode == .audio {
                     AudioCanvas(studio: audioStudio).transition(.opacity)
                 } else if mode == .settings {
-                    settingsDetail.transition(.opacity)
+                    ControlPanelDetail().transition(.opacity)
                 } else {
                     chatDetail.transition(.opacity)
                 }
@@ -183,36 +193,6 @@ struct ChatMainView: View {
         NativeChatView()
     }
 
-    private var settingsSidebar: some View {
-        List(selection: Binding(
-            get: { control.settingsSection },
-            set: { control.settingsSection = $0 }
-        )) {
-            Section {
-                Label(Section_.chatSettings.title(loc), systemImage: Section_.chatSettings.icon)
-                    .tag(Section_.chatSettings)
-                Label(Section_.settings.title(loc), systemImage: Section_.settings.icon)
-                    .tag(Section_.settings)
-            } header: {
-                Text(loc.t("Ajustes", "Settings"))
-            }
-        }
-        .listStyle(.sidebar)
-    }
-
-    private var settingsDetail: some View {
-        Group {
-            switch control.settingsSection {
-            case .chatSettings:
-                ChatSettingsView()
-            default:
-                SettingsView()
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(WorkspaceStyle.canvas)
-    }
-
     private func applyPendingMainMode() {
         guard let pending = control.pendingMainMode else { return }
         mode = pending
@@ -266,8 +246,7 @@ struct ChatMainView: View {
                     "Switch between chat, images, video, audio, and settings."))
         .background {
             Button("") {
-                control.settingsSection = .settings
-                mode = .settings
+                openControl(.settings)
             }
             .keyboardShortcut(",", modifiers: .command)
             .opacity(0)
@@ -277,10 +256,6 @@ struct ChatMainView: View {
 
     private func modeButton(_ value: MainMode, title: String, icon: String) -> some View {
         Button {
-            if value == .settings, control.settingsSection != .chatSettings,
-               control.settingsSection != .settings {
-                control.settingsSection = .settings
-            }
             mode = value
         } label: {
             Label(title, systemImage: icon)
@@ -307,28 +282,20 @@ struct ChatMainView: View {
                     Label(loc.t("Actualización", "Update"), systemImage: "arrow.down.app.fill")
                         .foregroundStyle(Color.appAccent)
                 }
-                .help(loc.t("ToshLLM %@ disponible... instálala desde Configuración → Inicio.",
-                            "ToshLLM %@ available... install it from Configuration → Home.", version))
+                .help(loc.t("ToshLLM %@ disponible... instálala desde Ajustes → Inicio.",
+                            "ToshLLM %@ available... install it from Settings → Home.", version))
             }
             ServerWebUIButton(server: server, presentation: .icon)
                 .buttonStyle(GlassIconButtonStyle())
                 .disabled(mode != .chat)
-            Button {
-                openControl(.dashboard)
-            } label: {
-                Label(loc.t("Configuración", "Configuration"), systemImage: "house")
-                    .labelStyle(.iconOnly)
-            }
-            .buttonStyle(GlassIconButtonStyle())
-            .accessibilityLabel(loc.t("Configuración", "Configuration"))
-            .help(loc.t("Panel de control: modelos, motor y benchmarks",
-                        "Control panel: models, engine, and benchmarks"))
+            // No separate Configuration window: the gear in modePicker is Settings.
         }
     }
 
+    /// Open configuration inside this window's Settings tab — never a second window.
     private func openControl(_ section: Section_? = nil) {
-        if let section { control.section = section }
-        openWindow(id: "control")
+        control.showControlInMain(section ?? .dashboard)
+        mode = .settings
     }
 
     private var loadingView: some View {
@@ -396,8 +363,7 @@ struct ChatMainView: View {
                                 "Switch models or download more."))
                 }
                 Button {
-                    control.settingsSection = .settings
-                    mode = .settings
+                    openControl(.settings)
                 } label: {
                     Label(loc.t("Ajustes", "Settings"), systemImage: "slider.horizontal.3")
                 }

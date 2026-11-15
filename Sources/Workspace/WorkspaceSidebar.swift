@@ -11,6 +11,11 @@ struct WorkspaceSidebar: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    /// When true, this sidebar lives inside the main window Settings tab.
+    var embeddedInMain: Bool = false
+    /// Switch the main window back to Chat (only used when embedded).
+    var onSwitchToChat: (() -> Void)? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
@@ -21,7 +26,13 @@ struct WorkspaceSidebar: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 5) {
                     navigationRow(.dashboard)
-                    Button { openWindow(id: "chat") } label: {
+                    Button {
+                        if embeddedInMain {
+                            onSwitchToChat?()
+                        } else {
+                            openWindow(id: "chat")
+                        }
+                    } label: {
                         Label(loc.t("Chat y estudio", "Chat & Studio"), systemImage: "bubble.left.and.bubble.right")
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 14).padding(.vertical, 11)
@@ -93,14 +104,19 @@ struct WorkspaceSidebar: View {
     }
 
     private func navigate(to section: Section_) {
-        if section == .settings || section == .chatSettings {
-            control.showSettingsInMain(section)
+        // Always stay in-process: when embedded, the main Settings tab already hosts this UI;
+        // when in the legacy window, still just switch sections (no second window).
+        if !embeddedInMain, section == .settings || section == .chatSettings {
+            control.showControlInMain(section)
             openWindow(id: "chat")
             return
         }
         animate {
             control.serverAnchor = nil
             control.section = section
+            if section == .chatSettings || section == .settings {
+                control.settingsSection = section
+            }
         }
     }
 

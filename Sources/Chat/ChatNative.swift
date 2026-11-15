@@ -3723,8 +3723,7 @@ struct NativeChatView: View {
                 Spacer(minLength: 8)
                 if modelPath.isEmpty {
                     Button(loc.t("Elegir modelo", "Choose model")) {
-                        control.section = .models
-                        openWindow(id: "control")
+                        control.showControlInMain(.models)
                     }
                     .buttonStyle(.borderedProminent)
                 } else {

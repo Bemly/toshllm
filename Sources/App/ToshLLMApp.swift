@@ -108,8 +108,8 @@ struct ToshLLMApp: App {
         }
         CommandGroup(replacing: .help) {
             Button(loc.t("Documentación de ToshLLM", "ToshLLM documentation")) {
-                obj.control.section = .docs
-                openWindow(id: "control")
+                obj.control.showControlInMain(.docs)
+                openWindow(id: "chat")
             }
             Button(loc.t("Reportar un problema", "Report an issue")) {
                 NSWorkspace.shared.open(URL(string: "https://github.com/engeldlgado/toshllm/issues")!)

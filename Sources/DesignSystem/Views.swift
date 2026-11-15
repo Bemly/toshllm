@@ -49,52 +49,42 @@ enum Section_: String, CaseIterable, Identifiable {
 
 let hardware = HardwareInfo.detect()
 
-/// The management window: hardware dashboard, models, benchmarks, docs and
-/// settings. The chat lives in its own (main) window.
-struct ControlPanelView: View {
+/// Detail pane shared by the standalone Configuration window and the main-window Settings tab.
+struct ControlPanelDetail: View {
     @EnvironmentObject var loc: Localizer
     @EnvironmentObject var control: ControlPanelState
     @EnvironmentObject private var manager: ServerManager
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @AppStorage(SettingsKeys.appAccent) private var accentRaw = AppTheme.defaultKey
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            WorkspaceSidebar()
-                .navigationSplitViewColumnWidth(min: 220, ideal: 244, max: 290)
-        } detail: {
-            VStack(spacing: 0) {
-                HStack(spacing: 14) {
-                    if selectedServer != nil {
-                        Button {
-                            control.serverAnchor = nil
-                        } label: {
-                            Label(loc.t("Volver a servidores", "Back to servers"), systemImage: "chevron.left")
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 13, weight: .medium))
-                    } else {
-                        SectionGlyph(systemName: control.section.icon)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(selectedServerTitle).font(.title2.bold())
-                            Text(subtitle).font(.system(size: 13)).foregroundStyle(.secondary)
-                        }
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                if selectedServer != nil {
+                    Button {
+                        control.serverAnchor = nil
+                    } label: {
+                        Label(loc.t("Volver a servidores", "Back to servers"), systemImage: "chevron.left")
                     }
-                    Spacer(minLength: 12)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                } else {
+                    SectionGlyph(systemName: control.section.icon)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(selectedServerTitle).font(.title2.bold())
+                        Text(subtitle).font(.system(size: 13)).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 12)
+                if !manager.servers.isEmpty {
                     ServerStatsToolbar().environmentObject(selectedServer ?? manager.servers[0])
                 }
-                .padding(.horizontal, 24).padding(.vertical, 16)
-                Divider().padding(.horizontal, 24)
-                WorkspaceDestinationView(section: control.section, serverID: control.serverAnchor)
+            }
+            .padding(.horizontal, 24).padding(.vertical, 16)
+            Divider().padding(.horizontal, 24)
+            WorkspaceDestinationView(section: control.section, serverID: control.serverAnchor)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .scrollContentBackground(.hidden)
-            }
-            .background(WorkspaceStyle.canvas)
         }
-        .tint(AppTheme.accent(accentRaw))
-        .id(accentRaw)
-        .navigationTitle(AppInfo.name)
+        .background(WorkspaceStyle.canvas)
     }
 
     private var selectedServer: ServerController? {
@@ -120,7 +110,25 @@ struct ControlPanelView: View {
         case .imageServer: return loc.t("sd.cpp en caliente: la caché de texto evita recargar el codificador.", "Warm sd.cpp: a cached prompt skips the text encoder.")
         }
     }
+}
 
+/// Legacy Configuration window (still registered). Primary UX is the main-window Settings tab.
+struct ControlPanelView: View {
+    @EnvironmentObject var loc: Localizer
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @AppStorage(SettingsKeys.appAccent) private var accentRaw = AppTheme.defaultKey
+
+    var body: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            WorkspaceSidebar(embeddedInMain: false)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 244, max: 290)
+        } detail: {
+            ControlPanelDetail()
+        }
+        .tint(AppTheme.accent(accentRaw))
+        .id(accentRaw)
+        .navigationTitle(AppInfo.name)
+    }
 }
 
 /// First-run guidance shown when no models are installed yet.

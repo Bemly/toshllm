@@ -229,8 +229,7 @@ struct AudioControls: View {
     }
 
     private func openModelCatalog() {
-        control.section = .models
-        openWindow(id: "control")
+        control.showControlInMain(.models)
     }
 
     @ViewBuilder
