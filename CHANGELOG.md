@@ -1,5 +1,12 @@
 # Changelog
 
+## [26.87.34] - 2026-11-15
+
+- Bemly fork engines via git submodules; llama-server adds kvmem/HyperCore compat API surface.
+- Same-port extra UIs: `/kvmem` and `/strata` via `--ui-mount` (one llama-server, no proxy).
+- Version line moved to 26.x to diverge from upstream ToshLLM 0.87.x.
+
+
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 

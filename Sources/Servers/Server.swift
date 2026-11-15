@@ -705,9 +705,29 @@ struct ServerSettings {
         return nil
     }
 
+    /// Extra same-port UIs under /kvmem and /strata (static dirs next to web-ui).
+    static var extraUIMountArgs: [String] {
+        guard let res = Bundle.main.resourceURL else { return [] }
+        // /monitor aliases the kvmem tree (its HTML historically used absolute /monitor/...)
+        let mounts: [(String, String)] = [
+            ("/kvmem", "web-ui-kvmem"),
+            ("/monitor", "web-ui-kvmem"),
+            ("/strata", "web-ui-strata"),
+        ]
+        var parts: [String] = []
+        for (prefix, name) in mounts {
+            let dir = res.appendingPathComponent(name).path
+            if FileManager.default.fileExists(atPath: dir + "/index.html") {
+                parts.append("\(prefix):\(dir)")
+            }
+        }
+        guard !parts.isEmpty else { return [] }
+        return ["--ui-mount", parts.joined(separator: ",")]
+    }
+
     /// The bundled web chat, starting in a new browser with the app's own image and PDF settings.
     static var chatUIArgs: [String] {
-        guard let ui = chatUIPath else { return [] }
+        guard let ui = chatUIPath else { return extraUIMountArgs }
         let d = UserDefaults.standard
         let megapixels = d.object(forKey: SettingsKeys.chatMaxImageMegapixels) == nil
             ? 1 : d.double(forKey: SettingsKeys.chatMaxImageMegapixels)
@@ -721,10 +741,11 @@ struct ServerSettings {
                 .joined(separator: ",")
             if !MapBase.labels { config["mapLabels"] = false }
         }
+        let mounts = extraUIMountArgs
         guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]) else {
-            return ["--path", ui] + tiles
+            return ["--path", ui] + mounts + tiles
         }
-        return ["--path", ui, "--ui-config", String(decoding: data, as: UTF8.self)] + tiles
+        return ["--path", ui, "--ui-config", String(decoding: data, as: UTF8.self)] + mounts + tiles
     }
 
     var environment: [String: String] {

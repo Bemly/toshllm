@@ -23,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SpeechDictationController.shared.shutdown()
             AppleSpeechDictationController.shared.shutdown()
             AudioStudioController.shared.shutdown()
+            ImageWebUIServer.shared.stop()
             NSApp.terminate(nil)
         }
         source.resume()
@@ -31,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Here and not when the chat window appears: a login item may open the app with
         // its window minimized or hidden.
         AppObjects.shared.server.startOnLaunchIfEnabled()
+        ImageWebUIServer.shared.syncWithPreference()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -38,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SpeechDictationController.shared.shutdown()
         AppleSpeechDictationController.shared.shutdown()
         AudioStudioController.shared.shutdown()
+        ImageWebUIServer.shared.stop()
         ImageGenPool.cleanupOutputsIfEnabled()
     }
 }

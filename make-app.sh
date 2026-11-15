@@ -118,6 +118,16 @@ if [ -f Assets/web-ui/index.html ]; then
 else
     echo "WARNING: Assets/web-ui missing; falling back to the basic console"
 fi
+# Same-port mounts: /kvmem and /strata (llama-server --ui-mount)
+for ui in web-ui-kvmem web-ui-strata; do
+    if [ -f "Assets/$ui/index.html" ]; then
+        mkdir -p "$APP/Contents/Resources/$ui"
+        (cd "Assets/$ui" && tar cf - .) | (cd "$APP/Contents/Resources/$ui" && tar xf -)
+        echo "bundled $ui"
+    else
+        echo "WARNING: Assets/$ui missing; mount skipped"
+    fi
+done
 
 mkdir -p "$APP/Contents/Resources/rich-content/mermaid/dist" \
          "$APP/Contents/Resources/rich-content/katex/dist/fonts" \

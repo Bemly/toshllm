@@ -10,12 +10,15 @@ import UniformTypeIdentifiers
 
 // Local text-to-image via a bundled stable-diffusion.cpp engine. A model is one
 // or more files (a full checkpoint, or a diffusion transformer plus its VAE and
-// text encoders). Downloads use the `imagen/` subfolder, while existing files
-// can be reused from anywhere below the models root.
+// text encoders).
+//
+// Storage matches sd-server / sd.cpp WebUI (`--model-dir models/vision`):
+//   vision/checkpoints|diffusion_models|text_encoders|tokenizers|vae|loras/
+// Generated PNGs still go under `imagen/` (outputs only, not weights).
 
 /// One downloadable piece of an image model, tagged with the sd-cli flag it maps to.
 struct ImageGenComponent: Identifiable {
-    enum Kind { case checkpoint, diffusion, vae, audioVAE, connectors, textEncoder, llmVision, t5, clipL }
+    enum Kind { case checkpoint, diffusion, vae, audioVAE, connectors, textEncoder, llmVision, t5, clipL, tokenizer }
     let kind: Kind
     let urlString: String
     let fileName: String
@@ -23,6 +26,17 @@ struct ImageGenComponent: Identifiable {
     /// Names the catalog downloaded this file under before; a copy already on disk still counts.
     var formerFileNames: [String] = []
     var id: String { fileName }
+
+    /// sd-server category folder under `models/vision/` (see examples/server/model_catalog.cpp).
+    var sdCategory: String {
+        switch kind {
+        case .checkpoint:  return "checkpoints"
+        case .diffusion:   return "diffusion_models"
+        case .vae, .audioVAE: return "vae"
+        case .tokenizer:   return "tokenizers"
+        case .textEncoder, .llmVision, .t5, .clipL, .connectors: return "text_encoders"
+        }
+    }
 
     /// The sd-cli argument this file is passed as.
     var flag: String {
@@ -36,6 +50,7 @@ struct ImageGenComponent: Identifiable {
         case .llmVision:   return "--llm_vision"
         case .t5:          return "--t5xxl"
         case .clipL:       return "--clip_l"
+        case .tokenizer:   return "--tokenizer"
         }
     }
 
@@ -47,13 +62,17 @@ struct ImageGenComponent: Identifiable {
         case .audioVAE:    return spanish ? "VAE de audio" : "Audio VAE"
         case .connectors:  return spanish ? "Conectores" : "Connectors"
         case .llmVision:   return spanish ? "Proyector de visión" : "Vision projector"
+        case .tokenizer:   return "Tokenizer"
         case .textEncoder, .t5, .clipL: return spanish ? "Codificador de texto" : "Text encoder"
         }
     }
 
-    /// Default path for a download; ModelStore may resolve an existing copy elsewhere.
-    func path(in dir: URL) -> URL {
-        fileName.hasPrefix("/") ? URL(fileURLWithPath: fileName) : dir.appendingPathComponent(fileName)
+    /// Install path under the vision root: `vision/<sdCategory>/<fileName>`.
+    func path(in visionRoot: URL) -> URL {
+        if fileName.hasPrefix("/") { return URL(fileURLWithPath: fileName) }
+        return visionRoot
+            .appendingPathComponent(sdCategory, isDirectory: true)
+            .appendingPathComponent(fileName)
     }
 }
 
@@ -62,7 +81,7 @@ struct ImageGenModel: Identifiable {
     let name: String
     let detailES: String
     let detailEN: String
-    let components: [ImageGenComponent]
+    var components: [ImageGenComponent]
     /// Steps the model is tuned for (Turbo/distilled models need very few).
     let defaultSteps: Int
     /// Guidance scale the model expects (Turbo models run at 1.0).
@@ -417,13 +436,92 @@ enum ImageGenCatalog {
         file: "qwen-image-2.1-turbo-Q8_0.gguf", formerFile: "Qwen-Image-2.1-Turbo-Q8_0.gguf",
         sizeGB: 7.64, minVRAMGB: 16, recommendable: false, turbo: true)
 
+    /// FLUX.2 VAE used by MOSS-Image (Comfy mirror). Local copies often keep the
+    /// shorter `flux2-vae.safetensors` name from the same tree.
+    private static let mossVAE = ImageGenComponent(kind: .vae,
+        urlString: "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/vae/flux2-vae.safetensors",
+        fileName: "flux2-vae.safetensors", sizeGB: 0.34,
+        formerFileNames: ["flux2_ae.safetensors"])
+
+    /// Qwen3.5 vocabulary → `vision/tokenizers/tokenizer.json` (sd-server tokenizer slot).
+    private static let mossTokenizer = ImageGenComponent(kind: .tokenizer,
+        urlString: "https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base/resolve/main/tokenizer/tokenizer.json",
+        fileName: "tokenizer.json", sizeGB: 0.02,
+        formerFileNames: ["tokenizer_qwen3.5.json"])
+
+    /// Default Qwen3.5-9B encoder for MOSS (Q8). Instance config can swap to Q4.
+    static let mossLLMQ8 = ImageGenComponent(kind: .textEncoder,
+        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
+        fileName: "Qwen3.5-9B-Q8_0.gguf", sizeGB: 9.53)
+
+    static let mossLLMQ4 = ImageGenComponent(kind: .textEncoder,
+        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+        fileName: "Qwen3.5-9B-Q4_K_M.gguf", sizeGB: 5.3)
+
+    /// MOSS-Image (5B DiT + FLUX.2 VAE + Qwen3.5-9B). Needs an external tokenizer.
+    static func mossImage(_ name: String, detailES: String, detailEN: String,
+                          repo: String, file: String, sizeGB: Double, minVRAMGB: Double,
+                          urlPath: String? = nil) -> ImageGenModel {
+        let path = urlPath ?? file
+        return ImageGenModel(
+            name: name, detailES: detailES, detailEN: detailEN,
+            components: [
+                ImageGenComponent(kind: .diffusion,
+                    urlString: "https://huggingface.co/\(repo)/resolve/main/\(path)",
+                    fileName: file, sizeGB: sizeGB),
+                mossVAE, mossLLMQ8, mossTokenizer,
+            ],
+            // Keep the DiT resident. --offload-to-cpu streams it from RAM each step and
+            // leaves the GPU half idle; the Qwen encoder stays on CPU via te=cpu because
+            // Q8 DiT + Q8 9B together do not fit a 16 GB card.
+            defaultSteps: 20, cfgScale: 3.0, minVRAMGB: minVRAMGB, recommendable: false,
+            maxLongEdge: 2048, displayMaxLongEdge: 1920, nativeLongEdge: 1024)
+    }
+
+    static let mossImageBaseQ8 = mossImage(
+        "MOSS-Image (Q8)",
+        detailES: "5B DiT Q8 + Qwen3.5-9B. Buen texto en imagen; necesita tokenizer externo.",
+        detailEN: "5B DiT Q8 + Qwen3.5-9B. Strong in-image text; needs an external tokenizer.",
+        repo: "leejet/MOSS-Image-Base-GGUF", file: "MOSS-Image-Base-Q8_0.gguf",
+        sizeGB: 5.48, minVRAMGB: 10)
+
+    /// Full BF16 DiT (UI label F16). Heavier resident weights than Q8.
+    static let mossImageBaseF16 = mossImage(
+        "MOSS-Image (F16)",
+        detailES: "5B DiT BF16 + Qwen3.5-9B. Más fiel, más VRAM que Q8.",
+        detailEN: "5B DiT BF16 + Qwen3.5-9B. Closer to full precision; more VRAM than Q8.",
+        repo: "Comfy-Org/MOSS-Image",
+        file: "moss_image_base_bf16.safetensors",
+        sizeGB: 10.2, minVRAMGB: 14,
+        urlPath: "diffusion_models/moss_image_base_bf16.safetensors")
+
+    static let mossImageSFTQ8 = mossImage(
+        "MOSS-Image SFT",
+        detailES: "5B SFT. Misma pila que Base, afinada para seguir el prompt.",
+        detailEN: "5B SFT. Same stack as Base, tuned for prompt following.",
+        repo: "leejet/MOSS-Image-SFT-GGUF", file: "MOSS-Image-SFT-Q8_0.gguf",
+        sizeGB: 5.48, minVRAMGB: 10)
+
     /// Curated order (small to large). Z-Image sits before SDXL so it wins the
     /// 8-12 GB tie as the recommended pick (validated for photorealism on AMD);
     /// klein 9B sits before schnell to win the 16 GB tie the same way.
     static let models: [ImageGenModel] = [sd15, zImageTurbo, sdxlTurbo, qwenImage21Q3, qwenImage21TurboQ3,
                                           flux2Klein4B, qwenImage21Q4, qwenImage21TurboQ4, flux2Klein9B,
                                           fluxSchnell, qwenImage21Q6, qwenImage21TurboQ6, qwenImage,
+                                          mossImageBaseQ8, mossImageBaseF16, mossImageSFTQ8,
                                           qwenImage21Q8, qwenImage21TurboQ8, flux2Dev]
+
+    /// Base MOSS Q8 ↔ F16 pair for the DiT precision switch.
+    static let mossBasePrecisionIDs: [String] = [mossImageBaseQ8.id, mossImageBaseF16.id]
+
+    static func isMossBase(_ modelID: String) -> Bool {
+        mossBasePrecisionIDs.contains(modelID) || modelID == "MOSS-Image"
+    }
+
+    /// Any MOSS catalog entry (Base or SFT) — shows the text-encoder picker.
+    static func isMossFamily(_ modelID: String) -> Bool {
+        isMossBase(modelID) || modelID == mossImageSFTQ8.id
+    }
 
     /// The best model this GPU can run: the highest min-VRAM tier that fits, and
     /// within a tie the earliest listed (curated preference).
@@ -433,7 +531,12 @@ enum ImageGenCatalog {
         return fitting.first { $0.minVRAMGB == top }
     }
 
-    static func model(id: String) -> ImageGenModel? { models.first { $0.id == id } }
+    static func model(id: String) -> ImageGenModel? {
+        if let m = models.first(where: { $0.id == id }) { return m }
+        // Pre-rename id from when Base Q8 was just "MOSS-Image".
+        if id == "MOSS-Image" { return mossImageBaseQ8 }
+        return nil
+    }
 
     /// Sentinel id for the user's own model (files picked from disk).
     static let customID = "__custom__"
@@ -627,6 +730,114 @@ enum ImageFormat: String, CaseIterable, Identifiable {
     var ext: String { rawValue }
 }
 
+/// Latent preview method passed to sd-cli `--preview` (none / proj / vae / tae).
+enum ImagePreviewMode: String, CaseIterable, Identifiable {
+    case none, proj, vae, tae
+    var id: String { rawValue }
+
+    func label(_ spanish: Bool) -> String {
+        switch self {
+        case .none: return spanish ? "Ninguna" : "None"
+        case .proj: return "proj"
+        case .vae:  return "vae"
+        case .tae:  return "tae"
+        }
+    }
+}
+
+/// Qwen3.5-9B quant for MOSS `--llm` (`vision/text_encoders/`).
+enum ImageMossTextEncoder: String, CaseIterable, Identifiable {
+    case q4 = "q4"
+    case q8 = "q8"
+    var id: String { rawValue }
+
+    var component: ImageGenComponent {
+        switch self {
+        case .q4: return ImageGenCatalog.mossLLMQ4
+        case .q8: return ImageGenCatalog.mossLLMQ8
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .q4: return "Q4"
+        case .q8: return "Q8"
+        }
+    }
+}
+
+/// Where the text encoder lives during a run (sd.cpp `--params-backend` / Bemly unload).
+enum ImageTEResidency: String, CaseIterable, Identifiable {
+    case teCpu = "teCpu"
+    case fullGpu = "fullGpu"
+    case encodeThenUnload = "encodeThenUnload"
+    var id: String { rawValue }
+
+    var cliArgs: [String] {
+        switch self {
+        case .teCpu: return ["--params-backend", "te=cpu"]
+        case .fullGpu: return []
+        case .encodeThenUnload: return ["--release-te-after-encode"]
+        }
+    }
+}
+
+extension ImageGenModel {
+    /// Swap the MOSS LLM file without touching DiT / VAE / tokenizer.
+    func withTextEncoder(_ te: ImageGenComponent) -> ImageGenModel {
+        var copy = self
+        copy.components = components.map { $0.kind == .textEncoder ? te : $0 }
+        return copy
+    }
+}
+
+/// sd-cli `--sampling-method` values (stable-diffusion.h `sample_method_to_str`).
+enum ImageSamplingMethod: String, CaseIterable, Identifiable {
+    case auto = ""
+    case euler, euler_a, heun, dpm2
+    case dpmpp2s_a = "dpm++2s_a"
+    case dpmpp2m = "dpm++2m"
+    case dpmpp2mv2 = "dpm++2mv2"
+    case ipndm, ipndm_v, lcm, ddim_trailing, tcd
+    case res_multistep, res_2s, er_sde
+    case euler_cfg_pp, euler_a_cfg_pp, euler_ge
+    case dpmpp2m_sde = "dpm++2m_sde"
+    case dpmpp2m_sde_bt = "dpm++2m_sde_bt"
+    case lms
+    var id: String { rawValue }
+
+    func label(_ spanish: Bool) -> String {
+        rawValue.isEmpty ? (spanish ? "Automático" : "Auto") : rawValue
+    }
+}
+
+/// sd-cli `--scheduler` values (stable-diffusion.h `scheduler_to_str`).
+enum ImageScheduler: String, CaseIterable, Identifiable {
+    case auto = ""
+    case discrete, karras, exponential, ays, gits, sgm_uniform
+    case simple, smoothstep, kl_optimal, lcm, bong_tangent
+    case ltx2, logit_normal, flux2, flux, beta, llada_image
+    var id: String { rawValue }
+
+    func label(_ spanish: Bool) -> String {
+        rawValue.isEmpty ? (spanish ? "Automático" : "Auto") : rawValue
+    }
+}
+
+/// Control image kinds for SDXL ControlNet Union (`--control-type`).
+enum ImageControlType: String, CaseIterable, Identifiable {
+    case auto = ""
+    case openpose, depth, scribble, canny, normal, segment, tile, repaint
+    var id: String { rawValue }
+
+    func label(_ spanish: Bool) -> String {
+        switch self {
+        case .auto: return spanish ? "Automático" : "Auto"
+        default: return rawValue
+        }
+    }
+}
+
 /// Step caching in the sampler: a cached step reuses the previous output instead of running
 /// the model. Faster, at the cost of detail. Measured on Qwen-Image 2.1 at 1024x1024 and 25
 /// steps against no cache: cache-dit 1.46x (PSNR 30.6 dB), spectrum 1.91x (30.6 dB),
@@ -778,9 +989,20 @@ final class ImageGenerator: ObservableObject {
                   initImagePath: String = "", maskPath: String = "",
                   strength: Double = 0.75,
                   referenceImagePaths: [String] = [],
-                  fastMode: ImageFastMode = .off) {
+                  fastMode: ImageFastMode = .off,
+                  previewMode: ImagePreviewMode = .proj,
+                  cfgScale: Double? = nil,
+                  samplingMethod: ImageSamplingMethod = .auto,
+                  scheduler: ImageScheduler = .auto,
+                  flowShift: Double = -1,
+                  slgScale: Double = 0, slgStart: Double = 0.01, slgEnd: Double = 0.2,
+                  slgLayers: String = "",
+                  controlNetPath: String = "", controlImagePath: String = "",
+                  controlStrength: Double = 0.9,
+                  controlType: ImageControlType = .auto) {
         guard !isBusy else { return }
         let steps = model.steps(steps)
+        let cfg = cfgScale ?? model.cfgScale
         // A reference that went missing would shift every <imageN> after it, so the run
         // stops instead of editing against the wrong picture.
         let refs = Array(referenceImagePaths.filter { !$0.isEmpty }.prefix(max(0, model.maxReferenceImages)))
@@ -804,15 +1026,14 @@ final class ImageGenerator: ObservableObject {
         for comp in model.components {
             args += [comp.flag, models.componentPath(comp).path]
         }
-        // sd-cli picks a LoRA up from the prompt, as <lora:file:weight>, but only when it knows
-        // where to look. The folder is only passed when it holds something, so an empty one
-        // does not make the engine scan on every run.
-        if let lora = ImageGenPool.loraDirectory(), ImageGenPool.loraFiles(in: lora).isEmpty == false {
+        // sd-cli picks LoRAs up from the prompt as <lora:file:weight>, but only when it knows
+        // where to look. The folder is only passed when it holds something.
+        if let lora = ImageGenPool.loraDirectory() {
             args += ["--lora-model-dir", lora.path]
         }
         args += [
             "-p", prompt,
-            "--cfg-scale", String(format: "%.1f", model.cfgScale),
+            "--cfg-scale", String(format: "%.2f", cfg),
             "--steps", String(steps),
         ]
         if !model.sigmas.isEmpty {
@@ -829,20 +1050,25 @@ final class ImageGenerator: ObservableObject {
             // 1600x900, which is what used to run past the largest block the card
             // allows. Also 12 to 14% quicker, same image (45.8 to 50.6 dB).
             "--diffusion-fa",
-            // The text encoder runs once and then sits in VRAM for the whole
-            // sampling: measured 1.56 GB freed on SDXL for 0.4 s of encode.
-            "--params-backend", "te=cpu",
             // The output format follows the file extension (PNG lossless, JPG lighter).
             "-o", out.path,
         ]
         let negative = negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !negative.isEmpty { args += ["-n", negative] }
-        // `proj` needs no extra weights (it projects the latents), so the preview
-        // costs a rescale per interval and never a second model download.
+        // Preview method is user-picked (none / proj / vae / tae). `proj` needs no
+        // extra weights; `tae` needs a Tiny AE on disk (--taesd).
         let preview = FileManager.default.temporaryDirectory
             .appendingPathComponent("toshllm-preview-\(token).png")
         previewURL = preview
-        args += ["--preview", "proj", "--preview-interval", "3", "--preview-path", preview.path]
+        if previewMode != .none {
+            args += ["--preview", previewMode.rawValue, "--preview-interval", "3",
+                     "--preview-path", preview.path]
+            if previewMode == .tae, let tae = ImageGenPool.taesdPath() {
+                args += ["--taesd", tae.path, "--taesd-preview-only"]
+            }
+        } else {
+            args += ["--preview", "none"]
+        }
         // img2img: seed the run with an existing image. Strength is how much to
         // change it (0 keeps it, 1 regenerates from scratch).
         if !initImagePath.isEmpty {
@@ -863,6 +1089,16 @@ final class ImageGenerator: ObservableObject {
            ImageGenLimits.workingSetGB(gpuIndex: gpuIndex) >= 11.5 {
             extra[i + 1] = String(tile)
         }
+        // User sampler/scheduler picks replace any catalog defaults in extraArgs.
+        func stripFlag(_ name: String) {
+            while let i = extra.firstIndex(of: name) {
+                extra.remove(at: i)
+                if i < extra.count { extra.remove(at: i) }
+            }
+        }
+        if !samplingMethod.rawValue.isEmpty { stripFlag("--sampling-method") }
+        if !scheduler.rawValue.isEmpty { stripFlag("--scheduler") }
+        if flowShift >= 0 { stripFlag("--flow-shift") }
         if split {
             // Merge the split assignment with the model's own --backend (e.g.
             // qwen-image forces vae=cpu), which wins per module.
@@ -876,6 +1112,45 @@ final class ImageGenerator: ObservableObject {
         // Offloading the diffusion model to CPU trades speed for VRAM; measured to
         // make no difference here, so it's off by default and only a fallback.
         args += extra
+        // TE residency (Advanced): te=cpu / full GPU / encode-then-unload.
+        // Model --params-backend in extraArgs still wins for that flag; unload can stack.
+        let teMode = ImageTEResidency(
+            rawValue: UserDefaults.standard.string(forKey: SettingsKeys.imagenTEResidency) ?? "")
+            ?? .encodeThenUnload
+        if !args.contains("--params-backend") {
+            args += teMode.cliArgs
+        } else if teMode == .encodeThenUnload, !args.contains("--release-te-after-encode") {
+            args.append("--release-te-after-encode")
+        }
+        if !samplingMethod.rawValue.isEmpty {
+            args += ["--sampling-method", samplingMethod.rawValue]
+        }
+        if !scheduler.rawValue.isEmpty {
+            args += ["--scheduler", scheduler.rawValue]
+        }
+        if flowShift >= 0 {
+            args += ["--flow-shift", String(format: "%.3f", flowShift)]
+        }
+        if slgScale > 0 {
+            args += ["--slg-scale", String(format: "%.3f", slgScale),
+                     "--skip-layer-start", String(format: "%.3f", slgStart),
+                     "--skip-layer-end", String(format: "%.3f", slgEnd)]
+            let layers = slgLayers.split(whereSeparator: { ",; ".contains($0) })
+                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if !layers.isEmpty {
+                args += ["--skip-layers", layers.map(String.init).joined(separator: ",")]
+            }
+        }
+        if !controlNetPath.isEmpty, FileManager.default.fileExists(atPath: controlNetPath) {
+            args += ["--control-net", controlNetPath,
+                     "--control-strength", String(format: "%.2f", controlStrength)]
+            if !controlImagePath.isEmpty, FileManager.default.fileExists(atPath: controlImagePath) {
+                args += ["--control-image", controlImagePath]
+            }
+            if !controlType.rawValue.isEmpty {
+                args += ["--control-type", controlType.rawValue]
+            }
+        }
         if !extra.contains("--cache-mode") {
             args += fastMode.args(for: model)
         }
@@ -1050,8 +1325,12 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
     var maskPath = ""
     var strength = 0.6
     var aspect = ImageAspect.square.rawValue
-    /// Free "W:H" ratio used only when `aspect` is `.custom` (e.g. "21:9").
+    /// Free "W:H" ratio used only when `aspect` is `.custom` and pixels are off.
     var customAspect = "21:9"
+    /// When custom framing uses absolute pixels instead of ratio × base size.
+    var customUsesPixels = true
+    var customWidth = 1024
+    var customHeight = 1024
     var baseSize = 1024
     var gpuIndex = 0
     /// GPU that hosts the text encoder + VAE, freeing `gpuIndex` for the
@@ -1062,6 +1341,27 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
     var format = ImageFormat.png.rawValue
     var offloadCPU = false
     var fastMode = ImageFastMode.off.rawValue
+    var previewMode = ImagePreviewMode.proj.rawValue
+    /// 0 = use the catalog model's `cfgScale`.
+    var cfgScale = 0.0
+    var samplingMethod = ImageSamplingMethod.auto.rawValue
+    var scheduler = ImageScheduler.auto.rawValue
+    /// < 0 = engine auto (MOSS default shift is 5).
+    var flowShift = -1.0
+    var slgScale = 0.0
+    var slgStart = 0.01
+    var slgEnd = 0.2
+    /// Comma-separated DiT layer indices for SLG; empty keeps the engine default.
+    var slgLayers = ""
+    /// Comfy-style explore: N short drafts, then continue winners at full steps.
+    var draftCount = 4
+    var draftSteps = 8
+    var controlNetPath = ""
+    var controlImagePath = ""
+    var controlStrength = 0.9
+    var controlType = ImageControlType.auto.rawValue
+    /// MOSS `--llm` quant: q4 / q8 (`ImageMossTextEncoder`).
+    var mossTextEncoder = ImageMossTextEncoder.q8.rawValue
 
     init() {}
 
@@ -1082,6 +1382,9 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
         strength = (try? c.decode(Double.self, forKey: .strength)) ?? 0.6
         aspect = (try? c.decode(String.self, forKey: .aspect)) ?? ImageAspect.square.rawValue
         customAspect = (try? c.decode(String.self, forKey: .customAspect)) ?? "21:9"
+        customUsesPixels = (try? c.decode(Bool.self, forKey: .customUsesPixels)) ?? true
+        customWidth = (try? c.decode(Int.self, forKey: .customWidth)) ?? 1024
+        customHeight = (try? c.decode(Int.self, forKey: .customHeight)) ?? 1024
         baseSize = (try? c.decode(Int.self, forKey: .baseSize)) ?? 1024
         gpuIndex = (try? c.decode(Int.self, forKey: .gpuIndex)) ?? 0
         auxGPUIndex = (try? c.decode(Int.self, forKey: .auxGPUIndex)) ?? -1
@@ -1090,6 +1393,23 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
         format = (try? c.decode(String.self, forKey: .format)) ?? ImageFormat.png.rawValue
         offloadCPU = (try? c.decode(Bool.self, forKey: .offloadCPU)) ?? false
         fastMode = (try? c.decode(String.self, forKey: .fastMode)) ?? ImageFastMode.off.rawValue
+        previewMode = (try? c.decode(String.self, forKey: .previewMode)) ?? ImagePreviewMode.proj.rawValue
+        cfgScale = (try? c.decode(Double.self, forKey: .cfgScale)) ?? 0
+        samplingMethod = (try? c.decode(String.self, forKey: .samplingMethod)) ?? ImageSamplingMethod.auto.rawValue
+        scheduler = (try? c.decode(String.self, forKey: .scheduler)) ?? ImageScheduler.auto.rawValue
+        flowShift = (try? c.decode(Double.self, forKey: .flowShift)) ?? -1
+        slgScale = (try? c.decode(Double.self, forKey: .slgScale)) ?? 0
+        slgStart = (try? c.decode(Double.self, forKey: .slgStart)) ?? 0.01
+        slgEnd = (try? c.decode(Double.self, forKey: .slgEnd)) ?? 0.2
+        slgLayers = (try? c.decode(String.self, forKey: .slgLayers)) ?? ""
+        draftCount = (try? c.decode(Int.self, forKey: .draftCount)) ?? 4
+        draftSteps = (try? c.decode(Int.self, forKey: .draftSteps)) ?? 8
+        controlNetPath = (try? c.decode(String.self, forKey: .controlNetPath)) ?? ""
+        controlImagePath = (try? c.decode(String.self, forKey: .controlImagePath)) ?? ""
+        controlStrength = (try? c.decode(Double.self, forKey: .controlStrength)) ?? 0.9
+        controlType = (try? c.decode(String.self, forKey: .controlType)) ?? ImageControlType.auto.rawValue
+        mossTextEncoder = (try? c.decode(String.self, forKey: .mossTextEncoder))
+            ?? ImageMossTextEncoder.q8.rawValue
     }
 
     var isCustom: Bool { modelID == ImageGenCatalog.customID }
@@ -1104,10 +1424,25 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
     var aspectValue: ImageAspect { ImageAspect(rawValue: aspect) ?? .square }
     var formatValue: ImageFormat { ImageFormat(rawValue: format) ?? .png }
     var fastModeValue: ImageFastMode { ImageFastMode(rawValue: fastMode) ?? .off }
+    var previewModeValue: ImagePreviewMode { ImagePreviewMode(rawValue: previewMode) ?? .proj }
+    var samplingMethodValue: ImageSamplingMethod { ImageSamplingMethod(rawValue: samplingMethod) ?? .auto }
+    var schedulerValue: ImageScheduler { ImageScheduler(rawValue: scheduler) ?? .auto }
+    var controlTypeValue: ImageControlType { ImageControlType(rawValue: controlType) ?? .auto }
+    var mossTextEncoderValue: ImageMossTextEncoder {
+        ImageMossTextEncoder(rawValue: mossTextEncoder) ?? .q8
+    }
+
+    func effectiveCfg(for model: ImageGenModel) -> Double {
+        if isCustom { return customCfg }
+        return cfgScale > 0 ? cfgScale : model.cfgScale
+    }
     var dimensions: (Int, Int) {
-        aspectValue == .custom
-            ? ImageAspect.customDimensions(ratio: customAspect, base: baseSize)
-            : aspectValue.dimensions(base: baseSize)
+        guard aspectValue == .custom else { return aspectValue.dimensions(base: baseSize) }
+        if customUsesPixels {
+            return (ImageAspect.gridSnap(Double(customWidth)),
+                    ImageAspect.gridSnap(Double(customHeight)))
+        }
+        return ImageAspect.customDimensions(ratio: customAspect, base: baseSize)
     }
 
     /// The model this instance runs: a catalog entry, the user's own files, or
@@ -1119,9 +1454,13 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
                                           isDiffusion: customIsDiffusion,
                                           steps: steps, cfg: customCfg)
         }
-        return ImageGenCatalog.model(id: modelID)
+        let base = ImageGenCatalog.model(id: modelID)
             ?? ImageGenCatalog.recommended(for: hw)
             ?? ImageGenCatalog.zImageTurbo
+        guard ImageGenCatalog.isMossFamily(modelID) || ImageGenCatalog.isMossFamily(base.id) else {
+            return base
+        }
+        return base.withTextEncoder(mossTextEncoderValue.component)
     }
 }
 
@@ -1130,6 +1469,8 @@ struct QueuedPrompt: Identifiable, Equatable {
     let id = UUID()
     var text: String
     var seed: Int = -1
+    /// Overrides the instance step count when set (draft explore / continue).
+    var steps: Int? = nil
     /// Instance this must run on, by config id; nil = any free instance. If the
     /// target instance is later removed, the scheduler treats it as untargeted.
     var targetInstanceID: UUID? = nil
@@ -1275,12 +1616,58 @@ final class ImageGenPool: ObservableObject {
 
     // MARK: prompt queue
 
-    func enqueue(_ text: String, seed: Int = -1, targetInstanceID: UUID? = nil, initImagePath: String? = nil) {
+    func enqueue(_ text: String, seed: Int = -1, steps: Int? = nil,
+                 targetInstanceID: UUID? = nil, initImagePath: String? = nil) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         let img = initImagePath?.isEmpty == false ? initImagePath : nil
-        queue.append(QueuedPrompt(text: t, seed: seed, targetInstanceID: targetInstanceID, initImagePath: img))
+        queue.append(QueuedPrompt(text: t, seed: seed, steps: steps,
+                                  targetInstanceID: targetInstanceID, initImagePath: img))
         if queueActive { pump() }
+    }
+
+    /// Comfy-style explore: N short drafts with fresh seeds on one instance.
+    func enqueueDraftBatch(for c: ImageInstanceConfig) {
+        let prompt = effectivePrompt(for: c)
+        guard !prompt.isEmpty else { return }
+        let n = max(1, min(c.draftCount, 16))
+        let draft = max(1, c.draftSteps)
+        for _ in 0..<n {
+            enqueue(prompt, seed: Int.random(in: 0..<Int(Int32.max)), steps: draft,
+                    targetInstanceID: c.id,
+                    initImagePath: c.initImagePath.isEmpty ? nil : c.initImagePath)
+        }
+        startQueue()
+    }
+
+    /// Continue a draft (or any gallery hit) to the instance's full step count, same seed.
+    func continueFull(from result: GeneratedImage, on c: ImageInstanceConfig) {
+        enqueue(result.prompt, seed: result.seed, steps: c.steps, targetInstanceID: c.id)
+        startQueue()
+    }
+
+    /// Shared sd-cli launch from an instance config (+ optional step/seed/init overrides).
+    func launchGenerate(_ c: ImageInstanceConfig, models: ModelStore,
+                        prompt: String, steps: Int, seed: Int,
+                        initImagePath: String? = nil) {
+        let model = c.resolvedModel(for: hardware)
+        let (w, h) = c.dimensions
+        generator(for: c.id).generate(
+            model: model, models: models, prompt: prompt,
+            negativePrompt: effectiveNegativePrompt(for: c),
+            width: w, height: h, steps: steps, seed: seed, format: c.formatValue,
+            offloadToCPU: c.offloadCPU, gpuIndex: c.gpuIndex,
+            auxGPUIndex: c.auxGPU(gpuCount: hardware.gpus.count) ?? -1,
+            initImagePath: initImagePath ?? c.initImagePath, maskPath: c.maskPath,
+            strength: c.strength, referenceImagePaths: c.referenceImagePaths,
+            fastMode: c.fastModeValue, previewMode: c.previewModeValue,
+            cfgScale: c.effectiveCfg(for: model),
+            samplingMethod: c.samplingMethodValue, scheduler: c.schedulerValue,
+            flowShift: c.flowShift,
+            slgScale: c.slgScale, slgStart: c.slgStart, slgEnd: c.slgEnd,
+            slgLayers: c.slgLayers,
+            controlNetPath: c.controlNetPath, controlImagePath: c.controlImagePath,
+            controlStrength: c.controlStrength, controlType: c.controlTypeValue)
     }
 
     func removeFromQueue(_ id: UUID) { queue.removeAll { $0.id == id } }
@@ -1328,15 +1715,9 @@ final class ImageGenPool: ObservableObject {
             let job = queue.remove(at: idx)
             busyGPUs.insert(c.gpuIndex)
             if let aux { busyGPUs.insert(aux) }
-            let (w, h) = c.dimensions
-            gen.generate(model: c.resolvedModel(for: hardware), models: models, prompt: job.text,
-                         negativePrompt: effectiveNegativePrompt(for: c),
-                         width: w, height: h, steps: c.steps, seed: job.seed, format: c.formatValue,
-                         offloadToCPU: c.offloadCPU, gpuIndex: c.gpuIndex, auxGPUIndex: aux ?? -1,
-                         initImagePath: job.initImagePath ?? c.initImagePath,
-                         maskPath: c.maskPath, strength: c.strength,
-                         referenceImagePaths: c.referenceImagePaths,
-                         fastMode: c.fastModeValue)
+            launchGenerate(c, models: models, prompt: job.text,
+                           steps: job.steps ?? c.steps, seed: job.seed,
+                           initImagePath: job.initImagePath)
         }
         if queue.isEmpty && !anyBusy { queueActive = false }
     }
@@ -1355,19 +1736,45 @@ final class ImageGenPool: ObservableObject {
         }
     }
 
-    /// Where LoRA files live: an `imagen/lora` folder next to the image models. Returns nil when
-    /// it does not exist, so nothing is passed to the engine until the user creates it.
+    /// LoRA folder for sd-cli `--lora-model-dir`. Prefers the directory that already
+    /// holds files (`vision/loras`, then `imagen/lora`, then empty stubs).
     nonisolated static func loraDirectory() -> URL? {
+        let root = ServerSettings.modelsDirectory
+        let candidates = [
+            root.appendingPathComponent("vision/loras", isDirectory: true),
+            root.appendingPathComponent("vision/lora", isDirectory: true),
+            root.appendingPathComponent("imagen/lora", isDirectory: true),
+        ]
+        let existing = candidates.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if let rich = existing.first(where: { !loraFiles(in: $0).isEmpty }) { return rich }
+        return existing.first
+    }
+
+    /// Folder opened by the LoRA menu's "Open folder" action (created if missing).
+    nonisolated static func loraDirectoryForOpen() -> URL {
+        if let dir = loraDirectory() { return dir }
         let dir = ServerSettings.modelsDirectory
-            .appendingPathComponent("imagen", isDirectory: true)
-            .appendingPathComponent("lora", isDirectory: true)
-        return FileManager.default.fileExists(atPath: dir.path) ? dir : nil
+            .appendingPathComponent("vision/loras", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
     nonisolated static func loraFiles(in dir: URL) -> [URL] {
         let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         return files.filter { ["safetensors", "ckpt", "pt"].contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    /// Tiny AutoEncoder for `--preview tae`, if present under the models tree.
+    nonisolated static func taesdPath() -> URL? {
+        let root = ServerSettings.modelsDirectory
+        let names = ["taesd.safetensors", "taef1.safetensors", "taeqi2_1.safetensors",
+                     "diffusion_pytorch_model.safetensors"]
+        let index = ModelFileIndex.scan(in: root)
+        for name in names {
+            if let url = index.file(named: name) { return url }
+        }
+        return nil
     }
 
     private func save() {

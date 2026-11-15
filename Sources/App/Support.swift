@@ -263,6 +263,12 @@ enum SettingsKeys {
     static let imagenInstances = "imagenInstances"
     /// Delete generated output images (toshllm_*) when the app quits.
     static let imagenCleanupOnClose = "imagenCleanupOnClose"
+    /// Keep sd-server (sd.cpp web UI + HTTP API) running in the background.
+    static let imagenWebUI = "imagenWebUI"
+    /// Listen port for the background sd-server (default 1234).
+    static let imagenWebUIPort = "imagenWebUIPort"
+    /// Text-encoder residency: teCpu / fullGpu / encodeThenUnload (ImageTEResidency).
+    static let imagenTEResidency = "imagenTEResidency"
     static let videoModel = "videoModel"
     static let videoFrames = "videoFrames"
     static let videoSteps = "videoSteps"

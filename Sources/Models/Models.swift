@@ -385,8 +385,11 @@ final class ModelStore: ObservableObject {
         return UserDefaults(suiteName: "dev.engel.toshllm")?.string(forKey: SettingsKeys.modelsDir) ?? ""
     }
 
-    /// Preferred destination for image and video components and generated media.
+    /// Generated images / masks / video frames (outputs only — not model weights).
     var imagenDirectory: URL { directory.appendingPathComponent("imagen", isDirectory: true) }
+
+    /// sd.cpp WebUI / sd-server model root (`--model-dir`). Category folders live under here.
+    var visionDirectory: URL { directory.appendingPathComponent("vision", isDirectory: true) }
 
     /// Speech-to-text checkpoints for the audio.cpp engine.
     var speechDirectory: URL { directory.appendingPathComponent("speech", isDirectory: true) }
@@ -464,13 +467,20 @@ final class ModelStore: ObservableObject {
         downloadSpeechAligner(model)
     }
 
-    /// Download an image-gen component into the `imagen/` subfolder under its fixed
-    /// name. Reuses the resumable transfer used for models; skips the projector
-    /// auto-fetch (components aren't vision models).
-    func downloadImageComponent(urlString: String, fileName: String, formerFileNames: [String] = []) {
+    /// Download an image-gen component into `vision/<sdCategory>/` (sd-server layout).
+    /// Reuses the resumable transfer used for models; skips the projector auto-fetch.
+    func downloadImageComponent(_ component: ImageGenComponent) {
+        downloadImageComponent(urlString: component.urlString, fileName: component.fileName,
+                               formerFileNames: component.formerFileNames, kind: component.kind)
+    }
+
+    func downloadImageComponent(urlString: String, fileName: String, formerFileNames: [String] = [],
+                                kind: ImageGenComponent.Kind = .checkpoint) {
         guard let remote = URL(string: urlString.trimmingCharacters(in: .whitespaces)),
               remote.scheme?.hasPrefix("http") == true else { return }
-        let dir = imagenDirectory
+        let category = ImageGenComponent(kind: kind, urlString: urlString, fileName: fileName,
+                                         sizeGB: 0, formerFileNames: formerFileNames).sdCategory
+        let dir = visionDirectory.appendingPathComponent(category, isDirectory: true)
         let dest = dir.appendingPathComponent(fileName)
         let names = componentNames(fileName: fileName, remote: remote, former: formerFileNames)
         if fileIndex?.file(namedAny: names, preferredDirectory: dir) != nil { return }
@@ -500,16 +510,18 @@ final class ModelStore: ObservableObject {
         }
     }
 
-    /// Resolves an image or video component anywhere in the models tree.
+    /// Resolves an image or video component anywhere in the models tree, preferring
+    /// the sd-server category folder under `vision/`.
     private func componentFile(_ component: ImageGenComponent) -> URL? {
         if component.fileName.hasPrefix("/") {
             let url = URL(fileURLWithPath: component.fileName)
             return FileManager.default.fileExists(atPath: url.path) ? url : nil
         }
         let remote = URL(string: component.urlString)
+        let preferred = visionDirectory.appendingPathComponent(component.sdCategory, isDirectory: true)
         return fileIndex?.file(namedAny: componentNames(fileName: component.fileName, remote: remote,
                                                         former: component.formerFileNames),
-                                preferredDirectory: imagenDirectory)
+                                preferredDirectory: preferred)
     }
 
     private func componentNames(fileName: String, remote: URL?, former: [String] = []) -> [String] {
@@ -519,20 +531,23 @@ final class ModelStore: ObservableObject {
     }
 
     func componentPath(_ component: ImageGenComponent) -> URL {
-        componentFile(component) ?? component.path(in: imagenDirectory)
+        componentFile(component) ?? component.path(in: visionDirectory)
     }
 
     func hasComponent(_ component: ImageGenComponent) -> Bool {
         componentFile(component) != nil
     }
 
-    /// The in-progress (or failed) download for an image component, matched inside
-    /// the `imagen/` subfolder so it can show live progress on its card.
+    /// In-progress download for an image component (vision category folder or legacy imagen/).
     func imageDownload(fileName: String) -> DownloadItem? {
-        downloads.last {
+        let categories: Set<String> = [
+            "imagen", "checkpoints", "diffusion_models", "text_encoders",
+            "tokenizers", "vae", "vae_approx", "clip_vision",
+        ]
+        return downloads.last {
             $0.destination.lastPathComponent == fileName
-                && $0.destination.deletingLastPathComponent().lastPathComponent == "imagen"
                 && !$0.finished
+                && categories.contains($0.destination.deletingLastPathComponent().lastPathComponent)
         }
     }
 

@@ -6,7 +6,9 @@ import Foundation
 
 /// One recursive inventory shared by LLM, image and video model detection.
 struct ModelFileIndex: Sendable {
-    private static let modelExtensions: Set<String> = ["gguf", "safetensors", "ckpt", "pth", "pt", "bin"]
+    /// Includes `json` so image tokenizers (MOSS `--tokenizer`) resolve like weight files.
+    /// LLM discovery still filters to GGUF via `GGUFFile`, so chat lists stay clean.
+    private static let modelExtensions: Set<String> = ["gguf", "safetensors", "ckpt", "pth", "pt", "bin", "json"]
     let root: URL
     let files: [URL]
     private let filesByName: [String: [URL]]

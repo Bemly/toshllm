@@ -33,7 +33,7 @@ struct ImageControls: View {
     private func startUpscale(_ urls: [URL]) {
         guard ImageUpscaler.installed(flavor, customPath: upscalerCustom, in: models) else {
             if let c = flavor.component(customPath: upscalerCustom), !c.urlString.isEmpty {
-                models.downloadImageComponent(urlString: c.urlString, fileName: c.fileName)
+                models.downloadImageComponent(c)
             }
             return
         }
@@ -61,7 +61,13 @@ struct ImageControls: View {
 
     /// Collapsed accordions (default: expanded).
     @State private var collapsed: Set<UUID> = []
+    /// Own expand state: a parent GlassPillButtonStyle breaks DisclosureGroup taps.
+    @State private var advancedExpanded = false
     @AppStorage(SettingsKeys.imagenCleanupOnClose) private var cleanupOnClose = false
+    @AppStorage(SettingsKeys.imagenWebUI) private var imagenWebUI = false
+    @AppStorage(SettingsKeys.imagenWebUIPort) private var imagenWebUIPort = 1234
+    @AppStorage(SettingsKeys.imagenTEResidency) private var teResidency = ImageTEResidency.encodeThenUnload.rawValue
+    @ObservedObject private var imageWebUI = ImageWebUIServer.shared
 
     var body: some View {
         VStack(spacing: 0) {
@@ -263,7 +269,7 @@ struct ImageControls: View {
 
             ForEach($pool.configs) { $cfg in
                 if pool.configs.count == 1 {
-                    ImageInstanceForm(cfg: $cfg,
+                    ImageInstanceForm(cfg: $cfg, pool: pool,
                                       isPrimary: true,
                                       canRemove: false,
                                       busy: pool.anyBusy,
@@ -280,18 +286,130 @@ struct ImageControls: View {
                     .font(.caption2).foregroundStyle(.orange)
             }
 
-            DisclosureGroup(loc.t("Avanzado", "Advanced")) {
-                Toggle(isOn: $cleanupOnClose) {
-                    Text(loc.t("Borrar imágenes al cerrar la app", "Delete images on app close"))
-                        .font(.caption)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(advancedExpanded ? 90 : 0))
+                    Text(loc.t("Avanzado", "Advanced"))
+                        .font(.callout)
+                    Spacer(minLength: 0)
                 }
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .padding(.top, 8)
-                .help(loc.t("Al salir de la app borra las imágenes generadas (toshllm_*) de la carpeta de salida, para no acumular cientos con los nombres por fecha.",
-                            "On quitting the app, deletes the generated images (toshllm_*) from the output folder, so the date-named files don't pile up."))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.15)) { advancedExpanded.toggle() }
+                }
+
+                if advancedExpanded {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(loc.t("Codificador de texto (VRAM)", "Text encoder (VRAM)"))
+                            .font(.caption)
+                        Picker("", selection: $teResidency) {
+                            ForEach(ImageTEResidency.allCases) { mode in
+                                Text(teResidencyLabel(mode)).tag(mode.rawValue)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        Text(teResidencyDetail(ImageTEResidency(rawValue: teResidency) ?? .encodeThenUnload))
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.top, 4)
+
+                    Toggle(isOn: $cleanupOnClose) {
+                        Text(loc.t("Borrar imágenes al cerrar la app", "Delete images on app close"))
+                            .font(.caption)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .help(loc.t("Al salir de la app borra las imágenes generadas (toshllm_*) de la carpeta de salida, para no acumular cientos con los nombres por fecha.",
+                                "On quitting the app, deletes the generated images (toshllm_*) from the output folder, so the date-named files don't pile up."))
+
+                    Toggle(isOn: $imagenWebUI) {
+                        Text(loc.t("sd.cpp WebUI en segundo plano", "sd.cpp WebUI in background"))
+                            .font(.caption)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .help(loc.t("Arranca sd-server con la carpeta vision/ (WebUI + API). Comparte GPU con Generar: no lo uses a la vez en AMD.",
+                                "Starts sd-server on the vision/ folder (WebUI + API). Shares the GPU with Generate: don't run both at once on AMD."))
+                    .onChange(of: imagenWebUI) { _, on in imageWebUI.setEnabled(on) }
+
+                    if imagenWebUI {
+                        HStack(spacing: 8) {
+                            Text(loc.t("Puerto", "Port")).font(.caption).foregroundStyle(.secondary)
+                            TextField("1234", value: $imagenWebUIPort, format: .number.grouping(.never))
+                                .workspaceTextField().frame(width: 64)
+                                .onChange(of: imagenWebUIPort) { _, _ in
+                                    if imageWebUI.isRunning {
+                                        imageWebUI.stop()
+                                        imageWebUI.start()
+                                    }
+                                }
+                            Spacer(minLength: 4)
+                            statusChip
+                            Button {
+                                imageWebUI.openInBrowser()
+                            } label: {
+                                Label(loc.t("Abrir", "Open"), systemImage: "safari")
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .disabled(ImageWebUIServer.bundledBinary() == nil)
+                        }
+                        if case .failed(let msg) = imageWebUI.state {
+                            Text(webUIError(msg)).font(.caption2).foregroundStyle(.orange)
+                        }
+                    }
+                }
             }
-            .font(.callout)
+        }
+    }
+
+    @ViewBuilder private var statusChip: some View {
+        switch imageWebUI.state {
+        case .stopped:
+            Text(loc.t("parado", "stopped")).font(.caption2).foregroundStyle(.secondary)
+        case .starting:
+            Text(loc.t("arrancando…", "starting…")).font(.caption2).foregroundStyle(.secondary)
+        case .running:
+            Text(loc.t("activo", "running")).font(.caption2).foregroundStyle(.green)
+        case .failed:
+            Text(loc.t("error", "error")).font(.caption2).foregroundStyle(.orange)
+        }
+    }
+
+    private func webUIError(_ code: String) -> String {
+        if code == "MISSING_SD_SERVER" {
+            return loc.t("sd-server no está en esta build.", "sd-server is missing from this build.")
+        }
+        return code
+    }
+
+    private func teResidencyLabel(_ mode: ImageTEResidency) -> String {
+        switch mode {
+        case .teCpu:
+            return loc.t("TE en CPU (te=cpu)", "TE on CPU (te=cpu)")
+        case .fullGpu:
+            return loc.t("GPU completa (sin te=cpu)", "Full GPU (no te=cpu)")
+        case .encodeThenUnload:
+            return loc.t("Codificar y soltar TE", "Encode then unload TE")
+        }
+    }
+
+    private func teResidencyDetail(_ mode: ImageTEResidency) -> String {
+        switch mode {
+        case .teCpu:
+            return loc.t("El encoder queda en RAM. Menos VRAM; la codificación es más lenta.",
+                         "Encoder stays in RAM. Lower VRAM; encoding is slower.")
+        case .fullGpu:
+            return loc.t("Como el WebUI: TE y DiT juntos en la GPU durante todo el run.",
+                         "Like the WebUI: TE and DiT share the GPU for the whole run.")
+        case .encodeThenUnload:
+            return loc.t("TE en GPU solo al codificar; luego se descarga y deja VRAM al muestreo.",
+                         "TE on GPU only while encoding; then unloaded so sampling can reuse VRAM.")
         }
     }
 
@@ -350,7 +468,7 @@ struct ImageControls: View {
         let expanded = Binding(get: { !collapsed.contains(c.id) },
                                set: { if $0 { collapsed.remove(c.id) } else { collapsed.insert(c.id) } })
         return DisclosureGroup(isExpanded: expanded) {
-            ImageInstanceForm(cfg: cfg,
+            ImageInstanceForm(cfg: cfg, pool: pool,
                               isPrimary: pool.configs.first?.id == c.id,
                               canRemove: pool.configs.count > 1,
                               busy: pool.anyBusy,
@@ -404,18 +522,9 @@ struct ImageControls: View {
         } else {
             Button {
                 for c in pool.configs where runnable(c) {
-                    let (w, h) = c.dimensions
-                    pool.generator(for: c.id).generate(
-                        model: c.resolvedModel(for: hardware), models: models,
-                        prompt: pool.effectivePrompt(for: c),
-                        negativePrompt: pool.effectiveNegativePrompt(for: c),
-                        width: w, height: h, steps: c.steps,
-                        seed: c.seed, format: c.formatValue, offloadToCPU: c.offloadCPU,
-                        gpuIndex: c.gpuIndex,
-                        auxGPUIndex: c.auxGPU(gpuCount: hardware.gpus.count) ?? -1,
-                        initImagePath: c.initImagePath, maskPath: c.maskPath,
-                        strength: c.strength, referenceImagePaths: c.referenceImagePaths,
-                        fastMode: c.fastModeValue)
+                    pool.launchGenerate(c, models: models,
+                                        prompt: pool.effectivePrompt(for: c),
+                                        steps: c.steps, seed: c.seed)
                 }
             } label: {
                 Label(loc.t("Generar", "Generate"), systemImage: "sparkles").frame(maxWidth: .infinity)
@@ -712,6 +821,7 @@ struct QueueFeedView: View {
                 Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : ""))
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                 HStack(spacing: 10) {
+                    continueButton(g)
                     Button { save(g) } label: { Label(loc.t("Guardar…", "Save…"), systemImage: "square.and.arrow.down") }
                         .glassButton()
                         .help(loc.t("Guarda una copia donde elijas.", "Save a copy wherever you choose."))
@@ -745,6 +855,7 @@ struct QueueFeedView: View {
                 if let label = g.instanceLabel { instanceBadge(label) }
             }
             HStack(spacing: 10) {
+                continueButton(g)
                 Button { save(g) } label: { Label(loc.t("Guardar…", "Save…"), systemImage: "square.and.arrow.down") }
                     .glassButton()
                     .help(loc.t("Guarda una copia donde elijas.", "Save a copy wherever you choose."))
@@ -758,6 +869,18 @@ struct QueueFeedView: View {
         }
         .padding(12)
         .cardSurface()
+    }
+
+    @ViewBuilder private func continueButton(_ g: GeneratedImage) -> some View {
+        Button {
+            if let c = pool.configs.first { pool.continueFull(from: g, on: c) }
+        } label: {
+            Label(loc.t("Continuar", "Continue"), systemImage: "forward.end")
+        }
+        .glassButton()
+        .disabled(pool.configs.isEmpty || g.seed < 0)
+        .help(loc.t("Misma semilla, pasos completos de la instancia (estilo KSampler).",
+                    "Same seed, instance full steps (KSampler-style)."))
     }
 
     /// Optional img2img source for queued prompts; sticks across adds, like the
@@ -864,6 +987,7 @@ struct FeedLayoutPicker: View {
 /// img2img, size, GPU, steps, seed, format and offload.
 struct ImageInstanceForm: View {
     @Binding var cfg: ImageInstanceConfig
+    @ObservedObject var pool: ImageGenPool
     let isPrimary: Bool
     let canRemove: Bool
     let busy: Bool
@@ -932,7 +1056,13 @@ struct ImageInstanceForm: View {
             if !cfg.isCustom && !installed {
                 installBox
             } else {
-                Text(loc.t("Descripción", "Prompt")).font(.headline)
+                HStack {
+                    Text(loc.t("Descripción", "Prompt")).font(.headline)
+                    Spacer()
+                    ImageLoraMenu(prompt: $cfg.prompt)
+                        .fixedSize()
+                        .disabled(busy)
+                }
                 promptEditor
                 negativePromptSection
                 if model.maxReferenceImages > 0 { referenceImagesSection }
@@ -962,25 +1092,24 @@ struct ImageInstanceForm: View {
     private var modelPicker: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(loc.t("Modelo", "Model")).font(.caption).foregroundStyle(.secondary)
-            Picker("", selection: $cfg.modelID) {
-                ForEach(ImageGenCatalog.models) { m in
+            Picker("", selection: modelFamilySelection) {
+                ForEach(ImageGenCatalog.models.filter {
+                    $0.id != ImageGenCatalog.mossImageBaseF16.id
+                }) { m in
+                    let label = m.id == ImageGenCatalog.mossImageBaseQ8.id ? "MOSS-Image" : m.name
                     let fits = m.fitsVRAMClass(targetVRAM)
-                    Text(fits ? m.name : "\(m.name) · \(Int(m.minVRAMGB)) GB+").tag(m.id)
+                        || (m.id == ImageGenCatalog.mossImageBaseQ8.id
+                            && ImageGenCatalog.mossImageBaseF16.fitsVRAMClass(targetVRAM))
+                    Text(fits ? label : "\(label) · \(Int(m.minVRAMGB)) GB+").tag(m.id)
                 }
                 Divider()
                 Text(loc.t("Personalizado…", "Custom…")).tag(ImageGenCatalog.customID)
             }
             .labelsHidden()
-            .onChange(of: cfg.modelID) {
-                if !cfg.isCustom { cfg.steps = model.defaultSteps }
-                if !cfg.fastModeValue.supports(model) { cfg.fastMode = ImageFastMode.off.rawValue }
-                // a square-trained model renders any other shape with colour blotches, so
-                // land on the one it knows instead of keeping the previous model's framing
-                if model.trainedSquareOnly { cfg.aspect = ImageAspect.square.rawValue }
-                clampBaseSize()
-            }
             .onChange(of: cfg.gpuIndex) { clampBaseSize() }
             .onAppear {
+                if cfg.cfgScale <= 0 { cfg.cfgScale = model.cfgScale }
+                if cfg.modelID == "MOSS-Image" { cfg.modelID = ImageGenCatalog.mossImageBaseQ8.id }
                 if ImageGenCatalog.model(id: cfg.modelID) == nil && !cfg.isCustom {
                     cfg.modelID = model.id
                 }
@@ -991,8 +1120,76 @@ struct ImageInstanceForm: View {
                 }
                 clampBaseSize()
             }
+            if ImageGenCatalog.isMossBase(cfg.modelID) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(loc.t("DiT", "DiT")).font(.caption2).foregroundStyle(.secondary)
+                    Picker("", selection: mossBasePrecision) {
+                        Text("Q8").tag(ImageGenCatalog.mossImageBaseQ8.id)
+                        Text("F16").tag(ImageGenCatalog.mossImageBaseF16.id)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help(loc.t("Q8 es más ligero; F16 (BF16) es más fiel y pide más VRAM.",
+                                "Q8 is lighter; F16 (BF16) is closer to full precision and needs more VRAM."))
+                }
+            }
+            if ImageGenCatalog.isMossFamily(cfg.modelID) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(loc.t("Codificador de texto", "Text encoder")).font(.caption2).foregroundStyle(.secondary)
+                    Picker("", selection: $cfg.mossTextEncoder) {
+                        ForEach(ImageMossTextEncoder.allCases) { te in
+                            Text(te.shortLabel).tag(te.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help(loc.t("Qwen3.5-9B en text_encoders/: Q4 más ligero, Q8 más fiel.",
+                                "Qwen3.5-9B under text_encoders/: Q4 is lighter, Q8 is closer to full precision."))
+                }
+            }
             Text(model.detail(loc.isSpanish)).font(.caption2).foregroundStyle(.secondary)
         }
+    }
+
+    /// Main picker collapses MOSS Base Q8/F16 onto one "MOSS-Image" row.
+    private var modelFamilySelection: Binding<String> {
+        Binding(
+            get: {
+                ImageGenCatalog.isMossBase(cfg.modelID)
+                    ? ImageGenCatalog.mossImageBaseQ8.id : cfg.modelID
+            },
+            set: { newID in
+                let next: String
+                if ImageGenCatalog.isMossBase(newID) {
+                    next = ImageGenCatalog.isMossBase(cfg.modelID)
+                        ? cfg.modelID : ImageGenCatalog.mossImageBaseQ8.id
+                } else {
+                    next = newID
+                }
+                applyModelSelection(next)
+            })
+    }
+
+    private var mossBasePrecision: Binding<String> {
+        Binding(
+            get: {
+                cfg.modelID == ImageGenCatalog.mossImageBaseF16.id
+                    ? ImageGenCatalog.mossImageBaseF16.id
+                    : ImageGenCatalog.mossImageBaseQ8.id
+            },
+            set: { applyModelSelection($0) })
+    }
+
+    private func applyModelSelection(_ newID: String) {
+        guard cfg.modelID != newID else { return }
+        cfg.modelID = newID
+        if !cfg.isCustom {
+            cfg.steps = model.defaultSteps
+            cfg.cfgScale = model.cfgScale
+        }
+        if !cfg.fastModeValue.supports(model) { cfg.fastMode = ImageFastMode.off.rawValue }
+        if model.trainedSquareOnly { cfg.aspect = ImageAspect.square.rawValue }
+        clampBaseSize()
     }
 
     /// Keep the base size within what the target GPU can hold (a smaller card,
@@ -1008,8 +1205,7 @@ struct ImageInstanceForm: View {
             ForEach(model.components) { componentRow($0) }
             Button {
                 for comp in model.components {
-                    models.downloadImageComponent(urlString: comp.urlString, fileName: comp.fileName,
-                                                  formerFileNames: comp.formerFileNames)
+                    models.downloadImageComponent(comp)
                 }
             } label: {
                 Label(loc.t("Descargar todo (%.1f GB)", "Download all (%.1f GB)")
@@ -1125,8 +1321,10 @@ struct ImageInstanceForm: View {
                     }
                 }
                 .help(tip)
-            if model.cfgScale <= 1, !cfg.negativePrompt.isEmpty {
-                Label(loc.t("Este modelo va a CFG %@ y no usa el prompt negativo. Necesita un modelo con CFG mayor que 1 (SD 1.5, Qwen-Image) o subir el CFG en un modelo propio.", "This model runs at CFG %@ and ignores the negative prompt. It needs a model with CFG above 1 (SD 1.5, Qwen-Image), or a higher CFG on your own model.", "\(String(format: "%.1f", model.cfgScale))"),
+            if cfg.effectiveCfg(for: model) <= 1, !cfg.negativePrompt.isEmpty {
+                Label(loc.t("Con CFG %@ el motor no usa el prompt negativo. Sube el CFG por encima de 1.",
+                            "At CFG %@ the engine ignores the negative prompt. Raise CFG above 1.",
+                            String(format: "%.1f", cfg.effectiveCfg(for: model))),
                       systemImage: "exclamationmark.triangle")
                     .font(.caption2).foregroundStyle(.yellow)
             }
@@ -1276,19 +1474,44 @@ struct ImageInstanceForm: View {
                 }.labelsHidden().frame(width: 96, alignment: .trailing)
             }
             if cfg.aspectValue == .custom {
-                row(loc.t("Proporción W:H", "Ratio W:H"),
-                    loc.t("Proporción libre como 21:9 (cine) o 3:2. El lado largo respeta el Tamaño base y la VRAM: no fija píxeles arbitrarios, así no cuelga la GPU.",
-                          "Free ratio like 21:9 (cinema) or 3:2. The long edge respects the Base size and VRAM: it sets no arbitrary pixel count, so the GPU can't hang.")) {
-                    TextField("21:9", text: $cfg.customAspect)
-                        .workspaceTextField().frame(width: 96)
+                row(loc.t("Modo", "Mode"),
+                    loc.t("Píxeles: ancho y alto fijos. Ratio: escala el lado largo del tamaño base.",
+                          "Pixels: fixed width and height. Ratio: scales the long edge from base size.")) {
+                    Picker("", selection: $cfg.customUsesPixels) {
+                        Text(loc.t("Píxeles", "Pixels")).tag(true)
+                        Text(loc.t("Ratio", "Ratio")).tag(false)
+                    }.labelsHidden().frame(width: 96, alignment: .trailing)
+                }
+                if cfg.customUsesPixels {
+                    row(loc.t("Ancho", "Width"),
+                        loc.t("Ancho en píxeles (múltiplo de 64).",
+                              "Width in pixels (multiple of 64).")) {
+                        TextField("", value: $cfg.customWidth, format: .number.grouping(.never))
+                            .workspaceTextField().frame(width: 96)
+                    }
+                    row(loc.t("Alto", "Height"),
+                        loc.t("Alto en píxeles (múltiplo de 64).",
+                              "Height in pixels (multiple of 64).")) {
+                        TextField("", value: $cfg.customHeight, format: .number.grouping(.never))
+                            .workspaceTextField().frame(width: 96)
+                    }
+                } else {
+                    row(loc.t("Proporción W:H", "Ratio W:H"),
+                        loc.t("Proporción libre como 21:9 o 3:2. El lado largo respeta el tamaño base.",
+                              "Free ratio like 21:9 or 3:2. The long edge respects the base size.")) {
+                        TextField("21:9", text: $cfg.customAspect)
+                            .workspaceTextField().frame(width: 96)
+                    }
                 }
             }
-            row(loc.t("Tamaño base", "Base size"),
-                loc.t("Lado largo en píxeles. El máximo se ajusta a la VRAM de la GPU.",
-                      "Long edge in pixels. The maximum adapts to the GPU's VRAM.")) {
-                Picker("", selection: $cfg.baseSize) {
-                    ForEach(baseSizes, id: \.self) { Text("\($0) px").tag($0) }
-                }.labelsHidden().frame(width: 96, alignment: .trailing)
+            if cfg.aspectValue != .custom || !cfg.customUsesPixels {
+                row(loc.t("Tamaño base", "Base size"),
+                    loc.t("Lado largo en píxeles. El máximo se ajusta a la VRAM de la GPU.",
+                          "Long edge in pixels. The maximum adapts to the GPU's VRAM.")) {
+                    Picker("", selection: $cfg.baseSize) {
+                        ForEach(baseSizes, id: \.self) { Text("\($0) px").tag($0) }
+                    }.labelsHidden().frame(width: 96, alignment: .trailing)
+                }
             }
             if !hardware.gpus.isEmpty {
                 row("GPU",
@@ -1325,18 +1548,96 @@ struct ImageInstanceForm: View {
             }
             row(loc.t("Pasos", "Steps"),
                 model.sigmas.isEmpty
-                    ? loc.t("Iteraciones de muestreo. Los modelos turbo/distilled están afinados para pocos pasos.",
-                            "Sampling iterations. Turbo/distilled models are tuned for few steps.")
+                    ? loc.t("Iteraciones de muestreo. Escribe el número que quieras (MOSS suele ir bien en 20–50).",
+                            "Sampling iterations. Type any number (MOSS often works well at 20–50).")
                     : loc.t("Este modelo va a %@ pasos fijos: trae su propio calendario de ruido y con otro la imagen sale mal.",
                             "This model runs a fixed %@ steps: it ships its own noise schedule, and any other one spoils the image.",
                             "\(model.steps(cfg.steps))")) {
-                Stepper(value: $cfg.steps, in: 4...30) { Text("\(model.steps(cfg.steps))").monospacedDigit() }.frame(width: 96, alignment: .trailing)
+                TextField("", value: $cfg.steps, format: .number.grouping(.never))
+                    .workspaceTextField().frame(width: 96)
                     .disabled(!model.sigmas.isEmpty)
+                    .onChange(of: cfg.steps) { _, v in
+                        if v < 1 { cfg.steps = 1 }
+                    }
+            }
+            if !cfg.isCustom {
+                row("CFG",
+                    loc.t("Escala de guía. MOSS ~3; turbo suele ir a 1 (el negativo no cuenta ahí).",
+                          "Guidance scale. MOSS ~3; turbo is usually 1 (negative prompt ignored there).")) {
+                    TextField("", value: $cfg.cfgScale, format: .number)
+                        .workspaceTextField().frame(width: 96)
+                }
+            }
+            row(loc.t("Muestreo", "Sampler"),
+                loc.t("Método de muestreo (euler, dpm++…). Auto deja el valor del catálogo o del motor.",
+                      "Sampling method (euler, dpm++…). Auto keeps the catalog or engine default.")) {
+                Picker("", selection: $cfg.samplingMethod) {
+                    ForEach(ImageSamplingMethod.allCases) { m in
+                        Text(m.label(loc.isSpanish)).tag(m.rawValue)
+                    }
+                }.labelsHidden().frame(width: 120, alignment: .trailing)
+            }
+            row(loc.t("Planificador", "Scheduler"),
+                loc.t("Calendario de ruido (discrete, sgm_uniform, karras…). Auto = motor.",
+                      "Noise schedule (discrete, sgm_uniform, karras…). Auto = engine.")) {
+                Picker("", selection: $cfg.scheduler) {
+                    ForEach(ImageScheduler.allCases) { s in
+                        Text(s.label(loc.isSpanish)).tag(s.rawValue)
+                    }
+                }.labelsHidden().frame(width: 120, alignment: .trailing)
+            }
+            row(loc.t("Flow shift", "Flow shift"),
+                loc.t("Desplazamiento de timesteps en modelos flow (MOSS por defecto 5). −1 = automático.",
+                      "Timestep shift for flow models (MOSS default 5). −1 = automatic.")) {
+                TextField("", value: $cfg.flowShift, format: .number)
+                    .workspaceTextField().frame(width: 96)
+            }
+            row(loc.t("SLG escala", "SLG scale"),
+                loc.t("Skip Layer Guidance (solo DiT). 0 = apagado.",
+                      "Skip Layer Guidance (DiT only). 0 = off.")) {
+                TextField("", value: $cfg.slgScale, format: .number)
+                    .workspaceTextField().frame(width: 96)
+            }
+            if cfg.slgScale > 0 {
+                row(loc.t("SLG inicio", "SLG start"),
+                    loc.t("Fracción del muestreo donde empieza SLG (0–1).",
+                          "Fraction of sampling where SLG starts (0–1).")) {
+                    TextField("", value: $cfg.slgStart, format: .number)
+                        .workspaceTextField().frame(width: 96)
+                }
+                row(loc.t("SLG fin", "SLG end"),
+                    loc.t("Fracción del muestreo donde termina SLG (0–1).",
+                          "Fraction of sampling where SLG ends (0–1).")) {
+                    TextField("", value: $cfg.slgEnd, format: .number)
+                        .workspaceTextField().frame(width: 96)
+                }
+                row(loc.t("SLG capas", "SLG layers"),
+                    loc.t("Índices de capas separados por comas. Vacío = valor del motor.",
+                          "Comma-separated layer indices. Empty = engine default.")) {
+                    TextField("7,8,9", text: $cfg.slgLayers)
+                        .workspaceTextField().frame(width: 96)
+                }
             }
             row(loc.t("Semilla", "Seed"),
                 loc.t("-1 = aleatoria. Fija un número para reproducir la misma imagen; distinta semilla = variación.",
                       "-1 = random. Set a number to reproduce the same image; a different seed = a variation.")) {
-                TextField("", value: $cfg.seed, format: .number).workspaceTextField().frame(width: 96)
+                TextField("", value: $cfg.seed, format: .number.grouping(.never))
+                    .workspaceTextField().frame(width: 96)
+            }
+            row(loc.t("Vista previa", "Preview"),
+                loc.t("Método de preview de latentes: none, proj (rápido), vae o tae (necesita Tiny AE).",
+                      "Latent preview method: none, proj (fast), vae, or tae (needs a Tiny AE).")) {
+                Picker("", selection: $cfg.previewMode) {
+                    ForEach(ImagePreviewMode.allCases) { mode in
+                        Text(mode.label(loc.isSpanish)).tag(mode.rawValue)
+                    }
+                }.labelsHidden().frame(width: 96, alignment: .trailing)
+            }
+            if cfg.previewModeValue == .tae && ImageGenPool.taesdPath() == nil {
+                Label(loc.t("No hay Tiny AE en models/; tae caerá o fallará hasta que añadas un taesd.*.safetensors.",
+                            "No Tiny AE under models/; tae will fail until you add a taesd.*.safetensors."),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.yellow)
             }
             row(loc.t("Formato", "Format"),
                 loc.t("JPG pesa mucho menos; PNG es sin pérdida.",
@@ -1360,7 +1661,80 @@ struct ImageInstanceForm: View {
                       "Keeps weights in RAM and streams them to VRAM per stage. Slower; only if VRAM is tight.")) {
                 Toggle("", isOn: $cfg.offloadCPU).labelsHidden().toggleStyle(.switch)
             }
+
+            samplerExploreSection
+            controlNetSection
         }
+    }
+
+    /// Comfy KSampler-style: batch short drafts, then continue winners at full steps.
+    private var samplerExploreSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(loc.t("Explorar (borradores)", "Explore (drafts)"))
+                .font(.caption).foregroundStyle(.secondary)
+            row(loc.t("Cantidad", "Count"),
+                loc.t("Cuántos borradores cortos generar con semillas distintas.",
+                      "How many short drafts to generate with different seeds.")) {
+                TextField("", value: $cfg.draftCount, format: .number.grouping(.never))
+                    .workspaceTextField().frame(width: 96)
+                    .onChange(of: cfg.draftCount) { _, v in cfg.draftCount = min(16, max(1, v)) }
+            }
+            row(loc.t("Pasos borrador", "Draft steps"),
+                loc.t("Pasos de cada borrador. Luego elige uno en la galería y pulsa Continuar.",
+                      "Steps per draft. Then pick one in the gallery and tap Continue.")) {
+                TextField("", value: $cfg.draftSteps, format: .number.grouping(.never))
+                    .workspaceTextField().frame(width: 96)
+                    .onChange(of: cfg.draftSteps) { _, v in if v < 1 { cfg.draftSteps = 1 } }
+            }
+            Button {
+                pool.enqueueDraftBatch(for: cfg)
+            } label: {
+                Label(loc.t("Generar borradores", "Generate drafts"),
+                      systemImage: "square.stack.3d.down.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .glassButton()
+            .controlSize(.small)
+            .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed)
+            .help(loc.t("Encola varios borradores cortos; en la galería usa Continuar para acabar con más pasos la misma semilla.",
+                        "Queues several short drafts; in the gallery use Continue to finish the same seed at full steps."))
+        }
+        .padding(.top, 4)
+    }
+
+    /// ControlNet: works with SD/SDXL-style nets. MOSS has no official ControlNet.
+    private var controlNetSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("ControlNet").font(.caption).foregroundStyle(.secondary)
+            if model.isTransformer {
+                Label(loc.t("MOSS / DiT no tienen ControlNet oficial en sd.cpp. Esto sirve sobre todo para SD/SDXL.",
+                            "MOSS / DiT have no official ControlNet in sd.cpp. This is mainly for SD/SDXL."),
+                      systemImage: "info.circle")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            filePickRow(loc.t("Modelo ControlNet", "ControlNet model"),
+                        path: $cfg.controlNetPath, types: ["safetensors", "gguf", "ckpt", "pth", "bin"])
+            filePickRow(loc.t("Imagen de control", "Control image"),
+                        path: $cfg.controlImagePath, types: ["png", "jpg", "jpeg", "webp"])
+            if !cfg.controlNetPath.isEmpty {
+                row(loc.t("Fuerza", "Strength"),
+                    loc.t("Cuánto pesa el ControlNet (1 = completo).",
+                          "How strongly ControlNet applies (1 = full).")) {
+                    TextField("", value: $cfg.controlStrength, format: .number)
+                        .workspaceTextField().frame(width: 96)
+                }
+                row(loc.t("Tipo", "Type"),
+                    loc.t("Para ControlNet Union (SDXL): openpose, depth, canny…",
+                          "For ControlNet Union (SDXL): openpose, depth, canny…")) {
+                    Picker("", selection: $cfg.controlType) {
+                        ForEach(ImageControlType.allCases) { t in
+                            Text(t.label(loc.isSpanish)).tag(t.rawValue)
+                        }
+                    }.labelsHidden().frame(width: 120, alignment: .trailing)
+                }
+            }
+        }
+        .padding(.top, 4)
     }
 
     /// The frame fits but sits near the VRAM ceiling; nudge the user to step down
@@ -1940,6 +2314,16 @@ struct ImageCanvas: View {
             Button { reusePrompt(result) } label: {
                 Label(loc.t("Reutilizar prompt", "Reuse prompt"), systemImage: "arrow.triangle.2.circlepath")
             }
+            Button {
+                if let c = pool.configs.first {
+                    pool.continueFull(from: result, on: c)
+                }
+            } label: {
+                Label(loc.t("Continuar pasos", "Continue steps"), systemImage: "forward.end")
+            }
+            .help(loc.t("Vuelve a generar con la misma semilla hasta los pasos completos de la instancia.",
+                        "Regenerate with the same seed up to the instance's full step count."))
+            .disabled(pool.configs.isEmpty || result.seed < 0)
             Button { save(result) } label: {
                 Label(loc.t("Guardar", "Save"), systemImage: "square.and.arrow.down")
             }
