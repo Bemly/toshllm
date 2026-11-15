@@ -363,6 +363,18 @@ struct ImageControls: View {
                             Text(webUIError(msg)).font(.caption2).foregroundStyle(.orange)
                         }
                     }
+
+                    // Draft explore + ControlNet: per-instance, under Advanced.
+                    ForEach($pool.configs) { $cfg in
+                        if pool.configs.count > 1 {
+                            Text(pool.instanceLabel(for: cfg.id)
+                                 ?? loc.t("Instancia", "Instance"))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 8)
+                        }
+                        ImageDraftControlExtras(cfg: $cfg, pool: pool, busy: pool.anyBusy)
+                    }
                 }
             }
         }
@@ -985,6 +997,130 @@ struct FeedLayoutPicker: View {
 
 /// Full configuration form of one instance: model (with inline install), prompt,
 /// img2img, size, GPU, steps, seed, format and offload.
+/// Draft explore + ControlNet for one instance; lives under the Images Advanced fold.
+private struct ImageDraftControlExtras: View {
+    @Binding var cfg: ImageInstanceConfig
+    @ObservedObject var pool: ImageGenPool
+    let busy: Bool
+
+    @EnvironmentObject var loc: Localizer
+    @EnvironmentObject var models: ModelStore
+
+    private var model: ImageGenModel { cfg.resolvedModel(for: hardware) }
+    private var installed: Bool { ImageGenerator.installed(model, in: models) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            exploreSection
+            controlNetSection
+        }
+    }
+
+    private var exploreSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(loc.t("Explorar (borradores)", "Explore (drafts)"))
+                .font(.caption).foregroundStyle(.secondary)
+            row(loc.t("Cantidad", "Count"),
+                loc.t("Cuántos borradores cortos generar con semillas distintas.",
+                      "How many short drafts to generate with different seeds.")) {
+                TextField("", value: $cfg.draftCount, format: .number.grouping(.never))
+                    .workspaceTextField().frame(width: 96)
+                    .onChange(of: cfg.draftCount) { _, v in cfg.draftCount = min(16, max(1, v)) }
+            }
+            row(loc.t("Pasos borrador", "Draft steps"),
+                loc.t("Pasos de cada borrador. Luego elige uno en la galería y pulsa Continuar.",
+                      "Steps per draft. Then pick one in the gallery and tap Continue.")) {
+                TextField("", value: $cfg.draftSteps, format: .number.grouping(.never))
+                    .workspaceTextField().frame(width: 96)
+                    .onChange(of: cfg.draftSteps) { _, v in if v < 1 { cfg.draftSteps = 1 } }
+            }
+            Button {
+                pool.enqueueDraftBatch(for: cfg)
+            } label: {
+                Label(loc.t("Generar borradores", "Generate drafts"),
+                      systemImage: "square.stack.3d.down.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .glassButton()
+            .controlSize(.small)
+            .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed)
+            .help(loc.t("Encola varios borradores cortos; en la galería usa Continuar para acabar con más pasos la misma semilla.",
+                        "Queues several short drafts; in the gallery use Continue to finish the same seed at full steps."))
+        }
+        .padding(.top, 4)
+    }
+
+    private var controlNetSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(loc.t("ControlNet", "ControlNet")).font(.caption).foregroundStyle(.secondary)
+            if model.isTransformer {
+                Label(loc.t("MOSS / DiT no tienen ControlNet oficial en sd.cpp. Esto sirve sobre todo para SD/SDXL.",
+                            "MOSS / DiT have no official ControlNet in sd.cpp. This is mainly for SD/SDXL."),
+                      systemImage: "info.circle")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            filePickRow(loc.t("Modelo ControlNet", "ControlNet model"),
+                        path: $cfg.controlNetPath, types: ["safetensors", "gguf", "ckpt", "pth", "bin"])
+            filePickRow(loc.t("Imagen de control", "Control image"),
+                        path: $cfg.controlImagePath, types: ["png", "jpg", "jpeg", "webp"])
+            if !cfg.controlNetPath.isEmpty {
+                row(loc.t("Fuerza", "Strength"),
+                    loc.t("Cuánto pesa el ControlNet (1 = completo).",
+                          "How strongly ControlNet applies (1 = full).")) {
+                    TextField("", value: $cfg.controlStrength, format: .number)
+                        .workspaceTextField().frame(width: 96)
+                }
+                row(loc.t("Tipo", "Type"),
+                    loc.t("Para ControlNet Union (SDXL): openpose, depth, canny…",
+                          "For ControlNet Union (SDXL): openpose, depth, canny…")) {
+                    Picker("", selection: $cfg.controlType) {
+                        ForEach(ImageControlType.allCases) { t in
+                            Text(t.rawValue.isEmpty ? loc.t("Automático", "Auto") : t.rawValue)
+                                .tag(t.rawValue)
+                        }
+                    }.labelsHidden().frame(width: 120, alignment: .trailing)
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func row<Content: View>(_ title: String, _ help: String,
+                                    @ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.callout)
+            Spacer(minLength: 8)
+            content().help(help)
+        }
+    }
+
+    private func filePickRow(_ title: String, path: Binding<String>, types: [String]) -> some View {
+        HStack(spacing: 6) {
+            Text(title).font(.caption)
+            Spacer(minLength: 6)
+            Button(path.wrappedValue.isEmpty
+                   ? loc.t("Elegir…", "Choose…")
+                   : (path.wrappedValue as NSString).lastPathComponent) {
+                pickFile(types: types) { path.wrappedValue = $0 }
+            }
+            .font(.caption).lineLimit(1).truncationMode(.middle).frame(maxWidth: 150, alignment: .trailing)
+            if !path.wrappedValue.isEmpty {
+                Button { path.wrappedValue = "" } label: { Label(loc.t("Quitar", "Clear"), systemImage: "xmark.circle") }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(GlassIconButtonStyle())
+                    .iconHelp(loc.t("Quitar el archivo", "Clear the file"))
+            }
+        }
+    }
+
+    private func pickFile(types: [String], onPick: @escaping (String) -> Void) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = types.compactMap { UTType(filenameExtension: $0) }
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url { onPick(url.path) }
+    }
+}
+
 struct ImageInstanceForm: View {
     @Binding var cfg: ImageInstanceConfig
     @ObservedObject var pool: ImageGenPool
@@ -1661,80 +1797,7 @@ struct ImageInstanceForm: View {
                       "Keeps weights in RAM and streams them to VRAM per stage. Slower; only if VRAM is tight.")) {
                 Toggle("", isOn: $cfg.offloadCPU).labelsHidden().toggleStyle(.switch)
             }
-
-            samplerExploreSection
-            controlNetSection
         }
-    }
-
-    /// Comfy KSampler-style: batch short drafts, then continue winners at full steps.
-    private var samplerExploreSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(loc.t("Explorar (borradores)", "Explore (drafts)"))
-                .font(.caption).foregroundStyle(.secondary)
-            row(loc.t("Cantidad", "Count"),
-                loc.t("Cuántos borradores cortos generar con semillas distintas.",
-                      "How many short drafts to generate with different seeds.")) {
-                TextField("", value: $cfg.draftCount, format: .number.grouping(.never))
-                    .workspaceTextField().frame(width: 96)
-                    .onChange(of: cfg.draftCount) { _, v in cfg.draftCount = min(16, max(1, v)) }
-            }
-            row(loc.t("Pasos borrador", "Draft steps"),
-                loc.t("Pasos de cada borrador. Luego elige uno en la galería y pulsa Continuar.",
-                      "Steps per draft. Then pick one in the gallery and tap Continue.")) {
-                TextField("", value: $cfg.draftSteps, format: .number.grouping(.never))
-                    .workspaceTextField().frame(width: 96)
-                    .onChange(of: cfg.draftSteps) { _, v in if v < 1 { cfg.draftSteps = 1 } }
-            }
-            Button {
-                pool.enqueueDraftBatch(for: cfg)
-            } label: {
-                Label(loc.t("Generar borradores", "Generate drafts"),
-                      systemImage: "square.stack.3d.down.right")
-                    .frame(maxWidth: .infinity)
-            }
-            .glassButton()
-            .controlSize(.small)
-            .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed)
-            .help(loc.t("Encola varios borradores cortos; en la galería usa Continuar para acabar con más pasos la misma semilla.",
-                        "Queues several short drafts; in the gallery use Continue to finish the same seed at full steps."))
-        }
-        .padding(.top, 4)
-    }
-
-    /// ControlNet: works with SD/SDXL-style nets. MOSS has no official ControlNet.
-    private var controlNetSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(loc.t("ControlNet", "ControlNet")).font(.caption).foregroundStyle(.secondary)
-            if model.isTransformer {
-                Label(loc.t("MOSS / DiT no tienen ControlNet oficial en sd.cpp. Esto sirve sobre todo para SD/SDXL.",
-                            "MOSS / DiT have no official ControlNet in sd.cpp. This is mainly for SD/SDXL."),
-                      systemImage: "info.circle")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            filePickRow(loc.t("Modelo ControlNet", "ControlNet model"),
-                        path: $cfg.controlNetPath, types: ["safetensors", "gguf", "ckpt", "pth", "bin"])
-            filePickRow(loc.t("Imagen de control", "Control image"),
-                        path: $cfg.controlImagePath, types: ["png", "jpg", "jpeg", "webp"])
-            if !cfg.controlNetPath.isEmpty {
-                row(loc.t("Fuerza", "Strength"),
-                    loc.t("Cuánto pesa el ControlNet (1 = completo).",
-                          "How strongly ControlNet applies (1 = full).")) {
-                    TextField("", value: $cfg.controlStrength, format: .number)
-                        .workspaceTextField().frame(width: 96)
-                }
-                row(loc.t("Tipo", "Type"),
-                    loc.t("Para ControlNet Union (SDXL): openpose, depth, canny…",
-                          "For ControlNet Union (SDXL): openpose, depth, canny…")) {
-                    Picker("", selection: $cfg.controlType) {
-                        ForEach(ImageControlType.allCases) { t in
-                            Text(t.label(loc.isSpanish)).tag(t.rawValue)
-                        }
-                    }.labelsHidden().frame(width: 120, alignment: .trailing)
-                }
-            }
-        }
-        .padding(.top, 4)
     }
 
     /// The frame fits but sits near the VRAM ceiling; nudge the user to step down
