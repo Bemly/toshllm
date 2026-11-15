@@ -893,8 +893,8 @@ struct QueueFeedView: View {
         }
         .glassButton()
         .disabled(pool.configs.isEmpty || !g.canContinue)
-        .help(loc.t("Sigue este borrador desde su latente hasta el final del mismo horario.",
-                    "Resume this draft from its latent through the rest of the same schedule."))
+        .help(loc.t("Sigue el latente del borrador hasta los Pasos borrador actuales. Si son el total, queda como producto; si no, sigue siendo un borrador.",
+                    "Resume the draft latent up to the current Draft steps. At full steps it becomes a finished product; otherwise it stays a continuable sketch."))
     }
 
     /// Optional img2img source for queued prompts; sticks across adds, like the
@@ -1030,11 +1030,14 @@ private struct ImageDraftControlExtras: View {
                     .onChange(of: cfg.draftCount) { _, v in cfg.draftCount = min(16, max(1, v)) }
             }
             row(loc.t("Pasos borrador", "Draft steps"),
-                loc.t("Pasos que se corren dentro del horario completo (D de S). Tiene que ser menor que los pasos de la instancia. Continuar retoma ese latente.",
-                      "Steps run inside the full schedule (D of S). Must be lower than the instance step count. Continue resumes that latent.")) {
+                loc.t("Hasta qué paso del horario completo (S) llega el borrador. Generar empieza en 0; Continuar avanza desde el latente hasta este número. Pon S para acabarlo como producto.",
+                      "How far into the full schedule (S) the sketch goes. Generate starts at 0; Continue advances the latent to this number. Set it to S to finish as a product.")) {
                 TextField("", value: $cfg.draftSteps, format: .number.grouping(.never))
                     .workspaceTextField().frame(width: 96)
-                    .onChange(of: cfg.draftSteps) { _, v in if v < 1 { cfg.draftSteps = 1 } }
+                    .onChange(of: cfg.draftSteps) { _, v in
+                        let maxS = model.steps(cfg.steps)
+                        cfg.draftSteps = min(maxS, max(1, v))
+                    }
             }
             Button {
                 pool.enqueueDraftBatch(for: cfg)
@@ -1047,8 +1050,8 @@ private struct ImageDraftControlExtras: View {
             .controlSize(.small)
             .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed
                       || !model.sigmas.isEmpty || cfg.draftSteps >= model.steps(cfg.steps))
-            .help(loc.t("Encola borradores que muestrean 0…D del horario completo y guardan el latente. Continuar termina D…S desde ese latente. No usa la imagen inicial.",
-                        "Queues drafts that sample 0…D of the full step schedule and save a latent. Continue finishes D…S from that latent. The init image is not used."))
+            .help(loc.t("Encola borradores 0…D con latente. La vista previa es una estimación limpia; el latente ruidoso sirve para Continuar. No usa la imagen inicial.",
+                        "Queues drafts 0…D with a latent. The preview is a clean estimate; the noisy latent is for Continue. The init image is not used."))
         }
         .padding(.top, 4)
     }
@@ -1934,6 +1937,9 @@ private func imageFailureText(_ raw: String, _ loc: Localizer) -> String {
     case "LATENT_MISMATCH":
         return loc.t("Continuar exige el mismo modelo, tamaño, pasos, muestreador, planificador, CFG, shift y prompts del borrador.",
                      "Continue needs the same model, size, steps, sampler, scheduler, CFG, shift and prompts as the draft.")
+    case "LATENT_STEP":
+        return loc.t("Sube Pasos borrador por encima del paso actual del borrador (o hasta el total para acabarlo).",
+                     "Raise Draft steps above the sketch's current step (or to the full count to finish it).")
     default:
         return loc.t("La generación falló (%@).", "Generation failed (%@).", "\(raw)")
     }
@@ -2394,8 +2400,8 @@ struct ImageCanvas: View {
             } label: {
                 Label(loc.t("Continuar pasos", "Continue steps"), systemImage: "forward.end")
             }
-            .help(loc.t("Sigue este borrador desde su latente hasta el final del mismo horario.",
-                        "Resume this draft from its latent through the rest of the same schedule."))
+            .help(loc.t("Sigue el latente del borrador hasta los Pasos borrador actuales. Si son el total, queda como producto; si no, sigue siendo un borrador.",
+                        "Resume the draft latent up to the current Draft steps. At full steps it becomes a finished product; otherwise it stays a continuable sketch."))
             .disabled(pool.configs.isEmpty || !result.canContinue)
             if !pool.continueNotice.isEmpty {
                 Text(imageFailureText(pool.continueNotice, loc))

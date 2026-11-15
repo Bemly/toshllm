@@ -1730,10 +1730,12 @@ final class ImageGenPool: ObservableObject {
         startQueue()
     }
 
-    /// Resume a draft latent from D to S on the same schedule. Refuses anything else.
+    /// Resume a draft latent to the current Draft steps value (or full S).
+    /// Draft steps > ended and < S keeps a continuable sketch; = S finishes a product.
     func continueFull(from result: GeneratedImage, on c: ImageInstanceConfig) {
         continueNotice = ""
-        guard let latentURL = result.latentURL, result.canContinue else {
+        guard let latentURL = result.latentURL, result.canContinue,
+              let ended = result.endedAtStep, let full = result.fullSteps else {
             continueNotice = "LATENT_MISSING"
             return
         }
@@ -1756,18 +1758,28 @@ final class ImageGenPool: ObservableObject {
             && result.prompt == saved.prompt
             && result.seed == saved.seed
             && effectiveNegativePrompt(for: c) == saved.negativePrompt
+            && saved.endedAtStep == ended
+            && saved.fullSteps == full
         guard same else {
             continueNotice = "LATENT_MISMATCH"
             return
         }
+        // Draft steps is the next stop. At or past full → finish the product.
+        var nextEnd = max(1, c.draftSteps)
+        if nextEnd > full { nextEnd = full }
+        guard nextEnd > ended else {
+            continueNotice = "LATENT_STEP"
+            return
+        }
+        let keepSketch = nextEnd < full
         let handoff = ImageLatentHandoff(
-            startAtStep: saved.endedAtStep, endAtStep: saved.fullSteps, addNoise: false,
-            latentInPath: latentURL.path, writeLatent: false, fullSteps: saved.fullSteps,
-            endedAtStep: saved.fullSteps, seed: result.seed, sampler: saved.sampler,
+            startAtStep: ended, endAtStep: nextEnd, addNoise: false,
+            latentInPath: latentURL.path, writeLatent: keepSketch, fullSteps: full,
+            endedAtStep: nextEnd, seed: result.seed, sampler: saved.sampler,
             scheduler: saved.scheduler, flowShift: saved.flowShift, cfgScale: saved.cfgScale,
             modelID: saved.modelID, textEncoder: saved.textEncoder, width: w, height: h,
             prompt: result.prompt, negativePrompt: saved.negativePrompt)
-        enqueue(result.prompt, seed: result.seed, steps: saved.fullSteps,
+        enqueue(result.prompt, seed: result.seed, steps: full,
                 targetInstanceID: c.id, handoff: handoff)
         startQueue()
     }
