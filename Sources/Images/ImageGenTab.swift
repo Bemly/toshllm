@@ -1705,7 +1705,7 @@ struct ImageInstanceForm: View {
     /// ControlNet: works with SD/SDXL-style nets. MOSS has no official ControlNet.
     private var controlNetSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("ControlNet").font(.caption).foregroundStyle(.secondary)
+            Text(loc.t("ControlNet", "ControlNet")).font(.caption).foregroundStyle(.secondary)
             if model.isTransformer {
                 Label(loc.t("MOSS / DiT no tienen ControlNet oficial en sd.cpp. Esto sirve sobre todo para SD/SDXL.",
                             "MOSS / DiT have no official ControlNet in sd.cpp. This is mainly for SD/SDXL."),
