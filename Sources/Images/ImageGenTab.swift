@@ -549,9 +549,9 @@ struct ImageControls: View {
     }
 }
 
-enum ImageDetailTab { case instances, queue }
+enum ImageDetailTab { case instances, queue, gallery, cache }
 
-private enum ImageGalleryOrder: String, CaseIterable, Identifiable {
+enum ImageGalleryOrder: String, CaseIterable, Identifiable {
     case recent, oldest
     var id: String { rawValue }
 }
@@ -2096,10 +2096,17 @@ struct ImageCanvas: View {
             }
             .frame(minHeight: 38)
 
-            if detailTab == .instances {
+            switch detailTab {
+            case .instances:
                 instancesCanvas
-            } else {
+            case .queue:
                 QueueFeedView(pool: pool)
+            case .gallery:
+                ImageGalleryBrowser(pool: pool) { _ in
+                    withAnimation(.easeInOut(duration: 0.16)) { detailTab = .instances }
+                }
+            case .cache:
+                ImageTECacheView()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -2115,6 +2122,14 @@ struct ImageCanvas: View {
                                 ? loc.t("Cola", "Queue")
                                 : loc.t("Cola %@", "Queue %@", "\(pool.queue.count)"),
                             systemImage: "list.bullet.rectangle")
+            detailTabButton(.gallery,
+                            title: pool.gallery.isEmpty
+                                ? loc.t("Galería", "Gallery")
+                                : loc.t("Galería %@", "Gallery %@", "\(pool.gallery.count)"),
+                            systemImage: "photo.on.rectangle")
+            detailTabButton(.cache,
+                            title: loc.t("Caché", "Cache"),
+                            systemImage: "internaldrive")
         }
         .padding(3)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -2130,7 +2145,7 @@ struct ImageCanvas: View {
             Label(title, systemImage: systemImage)
                 .font(.callout.weight(detailTab == tab ? .semibold : .medium))
                 .foregroundStyle(detailTab == tab ? Color.white : Color.secondary)
-                .frame(width: 118, height: 30)
+                .frame(width: 96, height: 30)
                 .background(detailTab == tab ? Color.appAccent : Color.clear,
                             in: RoundedRectangle(cornerRadius: 7))
                 .contentShape(Rectangle())
@@ -2420,7 +2435,12 @@ struct ImageCanvas: View {
 
     private func reusePrompt(_ result: GeneratedImage) {
         guard !pool.configs.isEmpty else { return }
-        pool.configs[0].prompt = result.prompt
+        if let record = result.record ?? ImageGalleryStore.loadSidecar(for: result.url) {
+            pool.importRecord(record)
+        } else {
+            pool.configs[0].prompt = result.prompt
+            if result.seed >= 0 { pool.configs[0].seed = result.seed }
+        }
     }
 
     private func save(_ result: GeneratedImage) {

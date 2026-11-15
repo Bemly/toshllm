@@ -149,6 +149,7 @@ struct ChatMainView: View {
         .hiddenChatToolbarBackground()
         .onAppear {
             imageGenPool.modelStore = models
+            imageGenPool.reloadPersistedGallery(from: models)
             videoGenPool.modelStore = models
             models.refreshIfNeeded()
             if !onboardingDone && models.models.isEmpty {

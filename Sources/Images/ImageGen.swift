@@ -889,9 +889,19 @@ final class ImageGenerator: ObservableObject {
     var onFinish: (() -> Void)?
     /// The last run's inputs, so the session gallery can label the result.
     private(set) var lastPrompt = ""
+    private(set) var lastNegativePrompt = ""
     private(set) var lastSeed = -1
     private(set) var lastWidth = 0
     private(set) var lastHeight = 0
+    private(set) var lastSteps = 0
+    private(set) var lastCfgScale = 0.0
+    private(set) var lastSamplingMethod = ""
+    private(set) var lastScheduler = ""
+    private(set) var lastFlowShift = -1.0
+    private(set) var lastStrength = 0.6
+    private(set) var lastModelID = ""
+    private(set) var lastFormat = "png"
+    private(set) var lastInitImagePath = ""
     /// Set only for a draft that wrote a latent. Empty on a normal run and on Continue.
     private(set) var lastLatentURL: URL?
     private(set) var lastFullSteps: Int?
@@ -1041,7 +1051,20 @@ final class ImageGenerator: ObservableObject {
             onFinish?()
             return
         }
-        lastPrompt = prompt; lastSeed = seed; lastWidth = width; lastHeight = height
+        lastPrompt = prompt
+        lastNegativePrompt = negativePrompt
+        lastSeed = seed
+        lastWidth = width
+        lastHeight = height
+        lastSteps = steps
+        lastCfgScale = cfg
+        lastSamplingMethod = samplingMethod.rawValue
+        lastScheduler = scheduler.rawValue
+        lastFlowShift = flowShift
+        lastStrength = strength
+        lastModelID = model.id
+        lastFormat = format.rawValue
+        lastInitImagePath = initImagePath
         lastBatch = []
         let dir = models.imagenDirectory
         // Timestamp plus a short token: a batch fired in the same second (one run
@@ -1614,7 +1637,7 @@ struct QueuedPrompt: Identifiable, Equatable {
 
 /// A finished image kept in the session gallery, with the inputs that made it.
 struct GeneratedImage: Identifiable {
-    let id = UUID()
+    let id: UUID
     let url: URL
     let image: NSImage
     let prompt: String
@@ -1629,11 +1652,43 @@ struct GeneratedImage: Identifiable {
     let latentURL: URL?
     let fullSteps: Int?
     let endedAtStep: Int?
+    /// Disk sidecar used by the Gallery tab to restore params after relaunch.
+    let record: ImageGalleryRecord?
+
+    init(id: UUID = UUID(), url: URL, image: NSImage, prompt: String, seed: Int,
+         width: Int, height: Int, duration: Int, instanceLabel: String?,
+         latentURL: URL?, fullSteps: Int?, endedAtStep: Int?,
+         record: ImageGalleryRecord? = nil) {
+        self.id = id
+        self.url = url
+        self.image = image
+        self.prompt = prompt
+        self.seed = seed
+        self.width = width
+        self.height = height
+        self.duration = duration
+        self.instanceLabel = instanceLabel
+        self.latentURL = latentURL
+        self.fullSteps = fullSteps
+        self.endedAtStep = endedAtStep
+        self.record = record
+    }
 
     var canContinue: Bool {
         guard let latentURL, let fullSteps, let endedAtStep else { return false }
         return endedAtStep > 0 && endedAtStep < fullSteps
             && FileManager.default.fileExists(atPath: latentURL.path)
+    }
+
+    static func from(record: ImageGalleryRecord) -> GeneratedImage? {
+        guard FileManager.default.fileExists(atPath: record.imagePath),
+              let image = NSImage(contentsOf: record.imageURL) else { return nil }
+        return GeneratedImage(
+            id: record.id, url: record.imageURL, image: image, prompt: record.prompt,
+            seed: record.seed, width: record.width, height: record.height,
+            duration: record.duration, instanceLabel: record.instanceLabel,
+            latentURL: record.latentURL, fullSteps: record.fullSteps,
+            endedAtStep: record.endedAtStep, record: record)
     }
 }
 
@@ -1663,6 +1718,34 @@ final class ImageGenPool: ObservableObject {
             configs = c
         } else {
             configs = [Self.legacyConfig()]
+        }
+    }
+
+    /// Reload disk gallery once the model store (and imagen folder) is known.
+    func reloadPersistedGallery(from models: ModelStore) {
+        let records = ImageGalleryStore.scan(imagenDirectory: models.imagenDirectory)
+        ImageGalleryStore.saveIndex(records, in: models.imagenDirectory)
+        gallery = records.compactMap(GeneratedImage.from(record:))
+    }
+
+    func importRecord(_ record: ImageGalleryRecord, into instanceID: UUID? = nil) {
+        let target = instanceID.flatMap { id in configs.firstIndex(where: { $0.id == id }) } ?? 0
+        guard configs.indices.contains(target) else { return }
+        record.apply(to: &configs[target])
+    }
+
+    func removeFromGallery(_ id: UUID) {
+        guard let idx = gallery.firstIndex(where: { $0.id == id }) else { return }
+        let item = gallery.remove(at: idx)
+        if let record = item.record {
+            ImageGalleryStore.delete(record)
+        } else {
+            try? FileManager.default.removeItem(at: item.url)
+            try? FileManager.default.removeItem(at: ImageGalleryRecord.sidecar(for: item.url))
+        }
+        if let models = modelStore {
+            let records = gallery.compactMap(\.record)
+            ImageGalleryStore.saveIndex(records, in: models.imagenDirectory)
         }
     }
 
@@ -1891,6 +1974,7 @@ final class ImageGenPool: ObservableObject {
     /// so every render stays visible even as instances move on to the next prompt.
     private func recordResult(from gen: ImageGenerator, instanceID: UUID) {
         let label = instanceLabel(for: instanceID)
+        let cfg = configs.first(where: { $0.id == instanceID })
         let items: [ImageGenerator.FinishedImageItem]
         if !gen.lastBatch.isEmpty {
             items = gen.lastBatch
@@ -1904,13 +1988,33 @@ final class ImageGenPool: ObservableObject {
         // Insert last→first so the first seed lands at the top of a newest-first gallery.
         for item in items.reversed() {
             if gallery.first?.url == item.url { continue }
-            gallery.insert(GeneratedImage(url: item.url, image: item.image, prompt: gen.lastPrompt,
-                                          seed: item.seed, width: gen.lastWidth, height: gen.lastHeight,
+            let record = ImageGalleryRecord(
+                id: UUID(), imagePath: item.url.path, createdAt: Date(),
+                prompt: gen.lastPrompt, negativePrompt: gen.lastNegativePrompt,
+                seed: item.seed, steps: gen.lastSteps,
+                width: gen.lastWidth, height: gen.lastHeight, duration: gen.lastDuration,
+                modelID: gen.lastModelID.isEmpty ? (cfg?.modelID ?? "") : gen.lastModelID,
+                cfgScale: gen.lastCfgScale,
+                samplingMethod: gen.lastSamplingMethod,
+                scheduler: gen.lastScheduler, flowShift: gen.lastFlowShift,
+                strength: gen.lastStrength,
+                aspect: cfg?.aspect ?? "", baseSize: cfg?.baseSize ?? 1024,
+                format: gen.lastFormat, initImagePath: gen.lastInitImagePath,
+                instanceLabel: label,
+                latentPath: item.latentURL?.path,
+                fullSteps: item.fullSteps, endedAtStep: item.endedAtStep)
+            ImageGalleryStore.writeSidecar(record)
+            gallery.insert(GeneratedImage(id: record.id, url: item.url, image: item.image,
+                                          prompt: gen.lastPrompt, seed: item.seed,
+                                          width: gen.lastWidth, height: gen.lastHeight,
                                           duration: gen.lastDuration, instanceLabel: label,
                                           latentURL: item.latentURL, fullSteps: item.fullSteps,
-                                          endedAtStep: item.endedAtStep), at: 0)
+                                          endedAtStep: item.endedAtStep, record: record), at: 0)
         }
-        while gallery.count > 60 { gallery.removeLast() }
+        while gallery.count > ImageGalleryStore.maxRecords { gallery.removeLast() }
+        if let models = modelStore {
+            ImageGalleryStore.saveIndex(gallery.compactMap(\.record), in: models.imagenDirectory)
+        }
     }
 
     /// True when `job` may run on `c`: untargeted, targeted at `c`, or its target

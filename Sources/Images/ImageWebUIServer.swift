@@ -35,6 +35,20 @@ final class ImageWebUIServer: ObservableObject {
         var error: String?
     }
 
+    struct ConditioningCacheSnapshot {
+        struct Entry {
+            var id: String
+            var prompt: String
+            var width: Int
+            var height: Int
+            var ageSeconds: Int
+        }
+        var capacity: Int
+        var size: Int
+        var modelLoaded: Bool
+        var entries: [Entry]
+    }
+
     enum ServerError: LocalizedError {
         case missingBinary
         case busy
@@ -238,6 +252,65 @@ final class ImageWebUIServer: ObservableObject {
 
     func cancelJob(_ id: String) async {
         _ = try? await request(path: "/sdcpp/v1/jobs/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+    }
+
+    func fetchConditioningCache() async throws -> ConditioningCacheSnapshot {
+        let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache", method: "GET", body: nil)
+        guard code == 200,
+              let json = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] else {
+            throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
+        }
+        func intField(_ any: Any?) -> Int {
+            switch any {
+            case let n as Int: return n
+            case let n as NSNumber: return n.intValue
+            default: return 0
+            }
+        }
+        let raw = json["entries"] as? [[String: Any]] ?? []
+        let entries = raw.compactMap { row -> ConditioningCacheSnapshot.Entry? in
+            guard let id = row["id"] as? String else { return nil }
+            return .init(id: id,
+                         prompt: row["prompt"] as? String ?? "",
+                         width: intField(row["width"]),
+                         height: intField(row["height"]),
+                         ageSeconds: intField(row["age_seconds"]))
+        }
+        return ConditioningCacheSnapshot(
+            capacity: intField(json["capacity"]),
+            size: intField(json["size"]),
+            modelLoaded: (json["model_loaded"] as? Bool) ?? true,
+            entries: entries)
+    }
+
+    func clearConditioningCache() async throws {
+        let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache", method: "DELETE", body: nil)
+        guard code == 200 else {
+            throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
+        }
+    }
+
+    func deleteConditioningCacheEntry(id: String) async throws {
+        let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? id
+        let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache?id=\(encoded)",
+                                                method: "DELETE", body: nil)
+        guard code == 200 else {
+            throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
+        }
+    }
+
+    /// Returns how many entries were removed.
+    func purgeConditioningCache(maxAgeSeconds: Int) async throws -> Int {
+        let body = try JSONSerialization.data(withJSONObject: ["max_age_seconds": maxAgeSeconds])
+        let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache/purge",
+                                                method: "POST", body: body)
+        guard code == 200,
+              let json = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] else {
+            throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
+        }
+        if let n = json["removed"] as? Int { return n }
+        if let n = json["removed"] as? NSNumber { return n.intValue }
+        return 0
     }
 
     func stop() {
