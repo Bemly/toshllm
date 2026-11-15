@@ -4,7 +4,7 @@
 
 import SwiftUI
 
-/// Persistent gallery of generated images (survives relaunch via sidecars).
+/// Persistent gallery of generated images (survives relaunch via sidecars / latent JSON).
 struct ImageGalleryBrowser: View {
     @ObservedObject var pool: ImageGenPool
     @EnvironmentObject var loc: Localizer
@@ -16,7 +16,7 @@ struct ImageGalleryBrowser: View {
     @AppStorage(SettingsKeys.imagenQueueGrid) private var grid = true
 
     private var ordered: [GeneratedImage] {
-        order == .recent ? pool.gallery : pool.gallery.reversed()
+        order == .recent ? pool.libraryGallery : pool.libraryGallery.reversed()
     }
 
     private var selected: GeneratedImage? {
@@ -26,7 +26,7 @@ struct ImageGalleryBrowser: View {
     var body: some View {
         VStack(spacing: 14) {
             toolbar
-            if pool.gallery.isEmpty {
+            if pool.libraryGallery.isEmpty {
                 emptyState
             } else {
                 GeometryReader { geo in
@@ -42,11 +42,11 @@ struct ImageGalleryBrowser: View {
             }
         }
         .onAppear {
-            if selectedID == nil { selectedID = ordered.first?.id }
             pool.reloadPersistedGallery(from: models)
+            if selectedID == nil { selectedID = ordered.first?.id }
         }
-        .onChange(of: pool.gallery.map(\.id)) {
-            if selectedID == nil || !pool.gallery.contains(where: { $0.id == selectedID }) {
+        .onChange(of: pool.libraryGallery.map(\.id)) {
+            if selectedID == nil || !pool.libraryGallery.contains(where: { $0.id == selectedID }) {
                 selectedID = ordered.first?.id
             }
         }
@@ -54,7 +54,7 @@ struct ImageGalleryBrowser: View {
 
     private var toolbar: some View {
         HStack(spacing: 10) {
-            Text(loc.t("%@ imágenes", "%@ images", "\(pool.gallery.count)"))
+            Text(loc.t("%@ imágenes", "%@ images", "\(pool.libraryGallery.count)"))
                 .font(.callout.weight(.medium))
                 .foregroundStyle(.secondary)
             Spacer()
@@ -98,6 +98,7 @@ struct ImageGalleryBrowser: View {
                     .scaledToFit()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+                metaBlock(for: item)
                 actions(for: item)
             } else {
                 Spacer()
@@ -105,21 +106,53 @@ struct ImageGalleryBrowser: View {
         }
     }
 
-    private func actions(for item: GeneratedImage) -> some View {
-        HStack(spacing: 10) {
-            if let prompt = item.prompt.nilIfEmpty {
+    private func metaBlock(for item: GeneratedImage) -> some View {
+        let record = ImageGalleryStore.enrich(
+            item.record
+                ?? ImageGalleryStore.loadSidecar(for: item.url)
+                ?? ImageGalleryStore.record(forImage: item.url)
+                ?? ImageGalleryRecord(imagePath: item.url.path))
+        let (rw, rh) = item.resolvedSize
+        let w = rw > 0 ? rw : record.width
+        let h = rh > 0 ? rh : record.height
+        let prompt = item.prompt.nilIfEmpty ?? record.prompt.nilIfEmpty
+        let seed = item.seed >= 0 ? item.seed : record.seed
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Text(w > 0 && h > 0 ? "\(w) × \(h)" : loc.t("Tamaño desconocido", "Unknown size"))
+                    .font(.caption.monospaced())
+                if seed >= 0 {
+                    Text("#\(seed)").font(.caption.monospaced()).foregroundStyle(.secondary)
+                }
+                if let model = record.modelID.nilIfEmpty {
+                    Text(model).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+            }
+            if let prompt {
                 Text(prompt)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 8)
-            if item.seed >= 0 {
-                Text("#\(item.seed)")
-                    .font(.caption.monospaced())
+                    .lineLimit(4)
+            } else {
+                Text(loc.t("Sin parámetros recuperables", "No recoverable parameters"))
+                    .font(.caption)
                     .foregroundStyle(.tertiary)
             }
-            if let record = item.record ?? ImageGalleryStore.loadSidecar(for: item.url) {
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+    }
+
+    private func actions(for item: GeneratedImage) -> some View {
+        let record = ImageGalleryStore.enrich(
+            item.record
+                ?? ImageGalleryStore.record(forImage: item.url)
+                ?? ImageGalleryStore.loadSidecar(for: item.url)
+                ?? ImageGalleryRecord(imagePath: item.url.path))
+        return HStack(spacing: 10) {
+            Spacer(minLength: 8)
+            if record.hasUsableParams || record.width > 0 {
                 Button {
                     pool.importRecord(record)
                     onImport?(record)
@@ -136,7 +169,7 @@ struct ImageGalleryBrowser: View {
                 Label(loc.t("Mostrar en Finder", "Reveal in Finder"), systemImage: "folder")
             }
             Button(role: .destructive) {
-                pool.removeFromGallery(item.id)
+                pool.removeFromLibrary(item.id)
             } label: {
                 Label(loc.t("Eliminar", "Delete"), systemImage: "trash")
             }
@@ -165,6 +198,9 @@ struct ImageGalleryBrowser: View {
                                     RoundedRectangle(cornerRadius: 8)
                                         .strokeBorder(item.id == selected?.id ? Color.appAccent : .clear, lineWidth: 2))
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                            Text(item.sizeLabel)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
                             if !grid {
                                 Text(item.prompt.isEmpty ? item.url.lastPathComponent : item.prompt)
                                     .font(.caption2)

@@ -830,7 +830,7 @@ struct QueueFeedView: View {
                         .font(.callout).lineLimit(3)
                     if let label = g.instanceLabel { instanceBadge(label) }
                 }
-                Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : "")
+                Text("\(g.sizeLabel) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : "")
                      + (g.canContinue ? " · \(g.endedAtStep ?? 0)/\(g.fullSteps ?? 0)" : ""))
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                 HStack(spacing: 10) {
@@ -862,7 +862,7 @@ struct QueueFeedView: View {
                 .font(.caption).lineLimit(2)
                 .help(g.prompt)
             HStack(spacing: 6) {
-                Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : "")
+                Text("\(g.sizeLabel) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : "")
                      + (g.canContinue ? " · \(g.endedAtStep ?? 0)/\(g.fullSteps ?? 0)" : ""))
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                 Spacer(minLength: 0)
@@ -1282,8 +1282,8 @@ struct ImageInstanceForm: View {
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
-                    .help(loc.t("Qwen3.5-9B en text_encoders/: Q4 más ligero, Q8 más fiel.",
-                                "Qwen3.5-9B under text_encoders/: Q4 is lighter, Q8 is closer to full precision."))
+                    .help(loc.t("Qwen3.5-9B en text_encoders/: Q4 / Q8 / Animus / Heretic.",
+                                "Qwen3.5-9B under text_encoders/: Q4 / Q8 / Animus / Heretic."))
                 }
             }
             Text(model.detail(loc.isSpanish)).font(.caption2).foregroundStyle(.secondary)
@@ -2045,6 +2045,13 @@ struct ImageCanvas: View {
         }
         .buttonStyle(GlassPillButtonStyle())
         .animation(.easeOut(duration: 0.16), value: presentsFullscreenImage)
+        .onAppear {
+            pool.modelStore = models
+            // Library only — never seed the session strip from disk.
+            if pool.libraryGallery.isEmpty {
+                pool.reloadPersistedGallery(from: models)
+            }
+        }
         .onChange(of: pool.gallery.map(\.id)) {
             selectedResultID = orderedGallery.first?.id
         }
@@ -2123,9 +2130,9 @@ struct ImageCanvas: View {
                                 : loc.t("Cola %@", "Queue %@", "\(pool.queue.count)"),
                             systemImage: "list.bullet.rectangle")
             detailTabButton(.gallery,
-                            title: pool.gallery.isEmpty
+                            title: pool.libraryGallery.isEmpty
                                 ? loc.t("Galería", "Gallery")
-                                : loc.t("Galería %@", "Gallery %@", "\(pool.gallery.count)"),
+                                : loc.t("Galería %@", "Gallery %@", "\(pool.libraryGallery.count)"),
                             systemImage: "photo.on.rectangle")
             detailTabButton(.cache,
                             title: loc.t("Caché", "Cache"),
@@ -2343,7 +2350,7 @@ struct ImageCanvas: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                         HStack(spacing: 5) {
-                            Text("\(result.width) × \(result.height)")
+                            Text(result.sizeLabel)
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.72)
                             Spacer(minLength: 2)
@@ -2392,11 +2399,12 @@ struct ImageCanvas: View {
     }
 
     private func resultFooter(_ result: GeneratedImage) -> some View {
-        HStack(spacing: 12) {
+        let size = result.resolvedSize
+        return HStack(spacing: 12) {
             Circle().fill(.green).frame(width: 9, height: 9)
             Text(loc.t("Generada en %@s", "Generated in %@s", "\(result.duration)"))
                 .font(.caption.weight(.medium)).foregroundStyle(.green)
-            Text("\(result.width) × \(result.height) · \(result.url.pathExtension.uppercased())"
+            Text("\(size.0) × \(size.1) · \(result.url.pathExtension.uppercased())"
                  + (result.seed >= 0 ? " · #\(result.seed)" : "")
                  + (result.canContinue ? " · \(result.endedAtStep ?? 0)/\(result.fullSteps ?? 0)" : ""))
                 .font(.system(size: 11, design: .monospaced))

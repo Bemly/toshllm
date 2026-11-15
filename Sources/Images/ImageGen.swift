@@ -458,6 +458,16 @@ enum ImageGenCatalog {
         urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
         fileName: "Qwen3.5-9B-Q4_K_M.gguf", sizeGB: 5.3)
 
+    /// Local fine-tune already under `vision/text_encoders/` (Animus V13 Q8).
+    static let mossLLMAnimus = ImageGenComponent(kind: .textEncoder,
+        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
+        fileName: "Qwen3.5-9B-Animus-V13.0-Q8_0.gguf", sizeGB: 9.53)
+
+    /// Local uncensored Q6_K fine-tune under `vision/text_encoders/`.
+    static let mossLLMHeretic = ImageGenComponent(kind: .textEncoder,
+        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
+        fileName: "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q6_K.gguf", sizeGB: 7.1)
+
     /// MOSS-Image (5B DiT + FLUX.2 VAE + Qwen3.5-9B). Needs an external tokenizer.
     static func mossImage(_ name: String, detailES: String, detailEN: String,
                           repo: String, file: String, sizeGB: Double, minVRAMGB: Double,
@@ -745,16 +755,20 @@ enum ImagePreviewMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// Qwen3.5-9B quant for MOSS `--llm` (`vision/text_encoders/`).
+/// Qwen3.5-9B (and fine-tunes) for MOSS `--llm` (`vision/text_encoders/`).
 enum ImageMossTextEncoder: String, CaseIterable, Identifiable {
     case q4 = "q4"
     case q8 = "q8"
+    case animus = "animus"
+    case heretic = "heretic"
     var id: String { rawValue }
 
     var component: ImageGenComponent {
         switch self {
         case .q4: return ImageGenCatalog.mossLLMQ4
         case .q8: return ImageGenCatalog.mossLLMQ8
+        case .animus: return ImageGenCatalog.mossLLMAnimus
+        case .heretic: return ImageGenCatalog.mossLLMHeretic
         }
     }
 
@@ -762,6 +776,8 @@ enum ImageMossTextEncoder: String, CaseIterable, Identifiable {
         switch self {
         case .q4: return "Q4"
         case .q8: return "Q8"
+        case .animus: return "Animus"
+        case .heretic: return "Heretic"
         }
     }
 }
@@ -1422,6 +1438,13 @@ final class ImageGenerator: ObservableObject {
         lastLatentURL = first.latentURL
         lastFullSteps = first.fullSteps
         lastEndedAtStep = first.endedAtStep
+        if let (pw, ph) = ImageGalleryStore.pixelSize(of: first.image) {
+            if lastWidth <= 0 { lastWidth = pw }
+            if lastHeight <= 0 { lastHeight = ph }
+        } else if let (pw, ph) = ImageGalleryStore.pixelSize(of: first.url) {
+            if lastWidth <= 0 { lastWidth = pw }
+            if lastHeight <= 0 { lastHeight = ph }
+        }
         progress = 1
         lastDuration = elapsed
         state = .done
@@ -1681,14 +1704,33 @@ struct GeneratedImage: Identifiable {
     }
 
     static func from(record: ImageGalleryRecord) -> GeneratedImage? {
-        guard FileManager.default.fileExists(atPath: record.imagePath),
-              let image = NSImage(contentsOf: record.imageURL) else { return nil }
+        let enriched = ImageGalleryStore.enrich(record)
+        guard FileManager.default.fileExists(atPath: enriched.imagePath),
+              let image = NSImage(contentsOf: enriched.imageURL) else { return nil }
+        var w = enriched.width
+        var h = enriched.height
+        if w <= 0 || h <= 0, let (pw, ph) = ImageGalleryStore.pixelSize(of: image) {
+            w = pw; h = ph
+        }
         return GeneratedImage(
-            id: record.id, url: record.imageURL, image: image, prompt: record.prompt,
-            seed: record.seed, width: record.width, height: record.height,
-            duration: record.duration, instanceLabel: record.instanceLabel,
-            latentURL: record.latentURL, fullSteps: record.fullSteps,
-            endedAtStep: record.endedAtStep, record: record)
+            id: enriched.id, url: enriched.imageURL, image: image, prompt: enriched.prompt,
+            seed: enriched.seed, width: w, height: h,
+            duration: enriched.duration, instanceLabel: enriched.instanceLabel,
+            latentURL: enriched.latentURL, fullSteps: enriched.fullSteps,
+            endedAtStep: enriched.endedAtStep, record: enriched)
+    }
+
+    var resolvedSize: (Int, Int) {
+        if width > 0, height > 0 { return (width, height) }
+        if let r = record, r.width > 0, r.height > 0 { return (r.width, r.height) }
+        if let (w, h) = ImageGalleryStore.pixelSize(of: image) { return (w, h) }
+        if let (w, h) = ImageGalleryStore.pixelSize(of: url) { return (w, h) }
+        return (0, 0)
+    }
+
+    var sizeLabel: String {
+        let (w, h) = resolvedSize
+        return w > 0 && h > 0 ? "\(w)×\(h)" : "—"
     }
 }
 
@@ -1704,8 +1746,10 @@ final class ImageGenPool: ObservableObject {
     @Published var continueNotice = ""
     /// While true, finished instances pull the next queued prompt automatically.
     @Published var queueActive = false
-    /// Completed results this session (newest first), shown in the Queue feed.
+    /// Results from this process only (Instance strip + Queue feed). Newest first.
     @Published var gallery: [GeneratedImage] = []
+    /// Disk library for the Gallery tab (survives relaunch). Newest first.
+    @Published var libraryGallery: [GeneratedImage] = []
     /// Set by the view so the scheduler can launch runs (generate() needs it).
     weak var modelStore: ModelStore?
     private var generators: [UUID: ImageGenerator] = [:]
@@ -1721,22 +1765,22 @@ final class ImageGenPool: ObservableObject {
         }
     }
 
-    /// Reload disk gallery once the model store (and imagen folder) is known.
+    /// Reload the on-disk library into `libraryGallery` without touching this session.
     func reloadPersistedGallery(from models: ModelStore) {
         let records = ImageGalleryStore.scan(imagenDirectory: models.imagenDirectory)
-        ImageGalleryStore.saveIndex(records, in: models.imagenDirectory)
-        gallery = records.compactMap(GeneratedImage.from(record:))
+        libraryGallery = records.compactMap(GeneratedImage.from(record:))
     }
 
     func importRecord(_ record: ImageGalleryRecord, into instanceID: UUID? = nil) {
+        let enriched = ImageGalleryStore.enrich(record)
         let target = instanceID.flatMap { id in configs.firstIndex(where: { $0.id == id }) } ?? 0
         guard configs.indices.contains(target) else { return }
-        record.apply(to: &configs[target])
+        enriched.apply(to: &configs[target])
     }
 
-    func removeFromGallery(_ id: UUID) {
-        guard let idx = gallery.firstIndex(where: { $0.id == id }) else { return }
-        let item = gallery.remove(at: idx)
+    func removeFromLibrary(_ id: UUID) {
+        guard let idx = libraryGallery.firstIndex(where: { $0.id == id }) else { return }
+        let item = libraryGallery.remove(at: idx)
         if let record = item.record {
             ImageGalleryStore.delete(record)
         } else {
@@ -1744,9 +1788,18 @@ final class ImageGenPool: ObservableObject {
             try? FileManager.default.removeItem(at: ImageGalleryRecord.sidecar(for: item.url))
         }
         if let models = modelStore {
-            let records = gallery.compactMap(\.record)
-            ImageGalleryStore.saveIndex(records, in: models.imagenDirectory)
+            ImageGalleryStore.saveIndex(libraryGallery.compactMap(\.record), in: models.imagenDirectory)
         }
+        gallery.removeAll { $0.id == id }
+    }
+
+    /// Prefer library removal when the Gallery tab asks; falls back to session.
+    func removeFromGallery(_ id: UUID) {
+        if libraryGallery.contains(where: { $0.id == id }) {
+            removeFromLibrary(id)
+            return
+        }
+        gallery.removeAll { $0.id == id }
     }
 
     /// Seed instance 1 from the pre-multi-instance per-key settings, so an
@@ -1988,11 +2041,22 @@ final class ImageGenPool: ObservableObject {
         // Insert last→first so the first seed lands at the top of a newest-first gallery.
         for item in items.reversed() {
             if gallery.first?.url == item.url { continue }
-            let record = ImageGalleryRecord(
-                id: UUID(), imagePath: item.url.path, createdAt: Date(),
+            var width = gen.lastWidth
+            var height = gen.lastHeight
+            if width <= 0 || height <= 0,
+               let (pw, ph) = ImageGalleryStore.pixelSize(of: item.image)
+                ?? ImageGalleryStore.pixelSize(of: item.url) {
+                width = pw
+                height = ph
+            }
+            let imagePath = ImageGalleryStore.canonicalPath(item.url.path)
+            let imageURL = URL(fileURLWithPath: imagePath)
+            let latentPath = item.latentURL.map { ImageGalleryStore.canonicalPath($0.path) }
+            let record = ImageGalleryStore.enrich(ImageGalleryRecord(
+                id: UUID(), imagePath: imagePath, createdAt: Date(),
                 prompt: gen.lastPrompt, negativePrompt: gen.lastNegativePrompt,
                 seed: item.seed, steps: gen.lastSteps,
-                width: gen.lastWidth, height: gen.lastHeight, duration: gen.lastDuration,
+                width: width, height: height, duration: gen.lastDuration,
                 modelID: gen.lastModelID.isEmpty ? (cfg?.modelID ?? "") : gen.lastModelID,
                 cfgScale: gen.lastCfgScale,
                 samplingMethod: gen.lastSamplingMethod,
@@ -2000,21 +2064,31 @@ final class ImageGenPool: ObservableObject {
                 strength: gen.lastStrength,
                 aspect: cfg?.aspect ?? "", baseSize: cfg?.baseSize ?? 1024,
                 format: gen.lastFormat, initImagePath: gen.lastInitImagePath,
+                mossTextEncoder: cfg?.mossTextEncoder ?? "",
                 instanceLabel: label,
-                latentPath: item.latentURL?.path,
-                fullSteps: item.fullSteps, endedAtStep: item.endedAtStep)
-            ImageGalleryStore.writeSidecar(record)
-            gallery.insert(GeneratedImage(id: record.id, url: item.url, image: item.image,
-                                          prompt: gen.lastPrompt, seed: item.seed,
-                                          width: gen.lastWidth, height: gen.lastHeight,
-                                          duration: gen.lastDuration, instanceLabel: label,
-                                          latentURL: item.latentURL, fullSteps: item.fullSteps,
-                                          endedAtStep: item.endedAtStep, record: record), at: 0)
+                latentPath: latentPath,
+                fullSteps: item.fullSteps, endedAtStep: item.endedAtStep))
+            if let models = modelStore {
+                ImageGalleryStore.upsert(record, in: models.imagenDirectory)
+            } else {
+                ImageGalleryStore.writeSidecar(record)
+            }
+            let generated = GeneratedImage(id: record.id, url: imageURL, image: item.image,
+                                           prompt: record.prompt, seed: record.seed,
+                                           width: record.width, height: record.height,
+                                           duration: record.duration, instanceLabel: label,
+                                           latentURL: latentPath.map { URL(fileURLWithPath: $0) },
+                                           fullSteps: item.fullSteps,
+                                           endedAtStep: item.endedAtStep, record: record)
+            gallery.insert(generated, at: 0)
+            let canon = imagePath
+            libraryGallery.removeAll {
+                ImageGalleryStore.canonicalPath($0.url.path) == canon
+            }
+            libraryGallery.insert(generated, at: 0)
         }
         while gallery.count > ImageGalleryStore.maxRecords { gallery.removeLast() }
-        if let models = modelStore {
-            ImageGalleryStore.saveIndex(gallery.compactMap(\.record), in: models.imagenDirectory)
-        }
+        while libraryGallery.count > ImageGalleryStore.maxRecords { libraryGallery.removeLast() }
     }
 
     /// True when `job` may run on `c`: untargeted, targeted at `c`, or its target
