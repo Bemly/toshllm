@@ -830,7 +830,8 @@ struct QueueFeedView: View {
                         .font(.callout).lineLimit(3)
                     if let label = g.instanceLabel { instanceBadge(label) }
                 }
-                Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : ""))
+                Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : "")
+                     + (g.canContinue ? " · \(g.endedAtStep ?? 0)/\(g.fullSteps ?? 0)" : ""))
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                 HStack(spacing: 10) {
                     continueButton(g)
@@ -861,7 +862,8 @@ struct QueueFeedView: View {
                 .font(.caption).lineLimit(2)
                 .help(g.prompt)
             HStack(spacing: 6) {
-                Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : ""))
+                Text("\(g.width)×\(g.height) · \(g.duration)s" + (g.seed >= 0 ? " · #\(g.seed)" : "")
+                     + (g.canContinue ? " · \(g.endedAtStep ?? 0)/\(g.fullSteps ?? 0)" : ""))
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                 Spacer(minLength: 0)
                 if let label = g.instanceLabel { instanceBadge(label) }
@@ -890,9 +892,9 @@ struct QueueFeedView: View {
             Label(loc.t("Continuar", "Continue"), systemImage: "forward.end")
         }
         .glassButton()
-        .disabled(pool.configs.isEmpty || g.seed < 0)
-        .help(loc.t("Misma semilla, pasos completos de la instancia (estilo KSampler).",
-                    "Same seed, instance full steps (KSampler-style)."))
+        .disabled(pool.configs.isEmpty || !g.canContinue)
+        .help(loc.t("Sigue este borrador desde su latente hasta el final del mismo horario.",
+                    "Resume this draft from its latent through the rest of the same schedule."))
     }
 
     /// Optional img2img source for queued prompts; sticks across adds, like the
@@ -1028,8 +1030,8 @@ private struct ImageDraftControlExtras: View {
                     .onChange(of: cfg.draftCount) { _, v in cfg.draftCount = min(16, max(1, v)) }
             }
             row(loc.t("Pasos borrador", "Draft steps"),
-                loc.t("Pasos de cada borrador. Luego elige uno en la galería y pulsa Continuar.",
-                      "Steps per draft. Then pick one in the gallery and tap Continue.")) {
+                loc.t("Pasos que se corren dentro del horario completo (D de S). Tiene que ser menor que los pasos de la instancia. Continuar retoma ese latente.",
+                      "Steps run inside the full schedule (D of S). Must be lower than the instance step count. Continue resumes that latent.")) {
                 TextField("", value: $cfg.draftSteps, format: .number.grouping(.never))
                     .workspaceTextField().frame(width: 96)
                     .onChange(of: cfg.draftSteps) { _, v in if v < 1 { cfg.draftSteps = 1 } }
@@ -1043,9 +1045,10 @@ private struct ImageDraftControlExtras: View {
             }
             .glassButton()
             .controlSize(.small)
-            .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed)
-            .help(loc.t("Encola varios borradores cortos; en la galería usa Continuar para acabar con más pasos la misma semilla.",
-                        "Queues several short drafts; in the gallery use Continue to finish the same seed at full steps."))
+            .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed
+                      || !model.sigmas.isEmpty || cfg.draftSteps >= model.steps(cfg.steps))
+            .help(loc.t("Encola borradores que muestrean 0…D del horario completo y guardan el latente. Continuar termina D…S desde ese latente. No usa la imagen inicial.",
+                        "Queues drafts that sample 0…D of the full step schedule and save a latent. Continue finishes D…S from that latent. The init image is not used."))
         }
         .padding(.top, 4)
     }
@@ -1925,6 +1928,12 @@ private func imageFailureText(_ raw: String, _ loc: Localizer) -> String {
     case "MISSING_REF":
         return loc.t("Falta una imagen de referencia (se movió o se borró). Quítala o vuelve a elegirla.",
                      "A reference image is missing (moved or deleted). Remove it or pick it again.")
+    case "LATENT_MISSING":
+        return loc.t("Falta el latente del borrador, así que esta imagen no puede continuar.",
+                     "The draft latent is missing, so this image cannot be continued.")
+    case "LATENT_MISMATCH":
+        return loc.t("Continuar exige el mismo modelo, tamaño, pasos, muestreador, planificador, CFG, shift y prompts del borrador.",
+                     "Continue needs the same model, size, steps, sampler, scheduler, CFG, shift and prompts as the draft.")
     default:
         return loc.t("La generación falló (%@).", "Generation failed (%@).", "\(raw)")
     }
@@ -2370,7 +2379,8 @@ struct ImageCanvas: View {
             Text(loc.t("Generada en %@s", "Generated in %@s", "\(result.duration)"))
                 .font(.caption.weight(.medium)).foregroundStyle(.green)
             Text("\(result.width) × \(result.height) · \(result.url.pathExtension.uppercased())"
-                 + (result.seed >= 0 ? " · #\(result.seed)" : ""))
+                 + (result.seed >= 0 ? " · #\(result.seed)" : "")
+                 + (result.canContinue ? " · \(result.endedAtStep ?? 0)/\(result.fullSteps ?? 0)" : ""))
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
@@ -2384,9 +2394,14 @@ struct ImageCanvas: View {
             } label: {
                 Label(loc.t("Continuar pasos", "Continue steps"), systemImage: "forward.end")
             }
-            .help(loc.t("Vuelve a generar con la misma semilla hasta los pasos completos de la instancia.",
-                        "Regenerate with the same seed up to the instance's full step count."))
-            .disabled(pool.configs.isEmpty || result.seed < 0)
+            .help(loc.t("Sigue este borrador desde su latente hasta el final del mismo horario.",
+                        "Resume this draft from its latent through the rest of the same schedule."))
+            .disabled(pool.configs.isEmpty || !result.canContinue)
+            if !pool.continueNotice.isEmpty {
+                Text(imageFailureText(pool.continueNotice, loc))
+                    .font(.caption2).foregroundStyle(.red)
+                    .lineLimit(2)
+            }
             Button { save(result) } label: {
                 Label(loc.t("Guardar", "Save"), systemImage: "square.and.arrow.down")
             }

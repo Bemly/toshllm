@@ -892,6 +892,11 @@ final class ImageGenerator: ObservableObject {
     private(set) var lastSeed = -1
     private(set) var lastWidth = 0
     private(set) var lastHeight = 0
+    /// Set only for a draft that wrote a latent. Empty on a normal run and on Continue.
+    private(set) var lastLatentURL: URL?
+    private(set) var lastFullSteps: Int?
+    private(set) var lastEndedAtStep: Int?
+    private var pendingLatentURL: URL?
 
     private var process: Process?
     private var startedAt: Date?
@@ -999,7 +1004,8 @@ final class ImageGenerator: ObservableObject {
                   slgLayers: String = "",
                   controlNetPath: String = "", controlImagePath: String = "",
                   controlStrength: Double = 0.9,
-                  controlType: ImageControlType = .auto) {
+                  controlType: ImageControlType = .auto,
+                  handoff: ImageLatentHandoff? = nil) {
         guard !isBusy else { return }
         let steps = model.steps(steps)
         let cfg = cfgScale ?? model.cfgScale
@@ -1157,6 +1163,30 @@ final class ImageGenerator: ObservableObject {
         if offloadToCPU && !extra.contains("--offload-to-cpu") {
             args.append("--offload-to-cpu")
         }
+        pendingLatentURL = nil
+        lastLatentURL = nil
+        lastFullSteps = nil
+        lastEndedAtStep = nil
+        if let handoff {
+            args += ["--start-at-step", String(handoff.startAtStep),
+                     "--end-at-step", String(handoff.endAtStep),
+                     "--add-noise", handoff.addNoise ? "on" : "off"]
+            if !handoff.latentInPath.isEmpty {
+                args += ["--latent-in", handoff.latentInPath]
+            }
+            if handoff.writeLatent {
+                let latent = out.deletingPathExtension().appendingPathExtension("sdlt")
+                args += ["--latent-out", latent.path]
+                let sidecar = URL(fileURLWithPath: latent.path + ".json")
+                if let data = try? JSONEncoder().encode(handoff) {
+                    try? data.write(to: sidecar)
+                    pendingLatentURL = latent
+                    lastLatentURL = latent
+                    lastFullSteps = handoff.fullSteps
+                    lastEndedAtStep = handoff.endedAtStep
+                }
+            }
+        }
 
         var env = ProcessInfo.processInfo.environment
         // The wide matmul tile is tuned for LLM prefill shapes; on diffusion it costs
@@ -1281,6 +1311,14 @@ final class ImageGenerator: ObservableObject {
         previewImage = nil
         defer { onFinish?() }
         guard status == 0, let img = NSImage(contentsOf: output) else {
+            if let latent = pendingLatentURL {
+                try? FileManager.default.removeItem(at: latent)
+                try? FileManager.default.removeItem(at: URL(fileURLWithPath: latent.path + ".json"))
+                pendingLatentURL = nil
+                lastLatentURL = nil
+                lastFullSteps = nil
+                lastEndedAtStep = nil
+            }
             // 15/SIGTERM and 2/SIGINT are user cancels, not errors.
             if status == 15 || status == 2 { state = .failed(""); return }
             // Map the two size-related failures to actionable messages instead of a
@@ -1464,6 +1502,29 @@ struct ImageInstanceConfig: Codable, Identifiable, Equatable {
     }
 }
 
+/// Step window plus the identity a draft must match before Continue.
+/// Absent on a normal generation, so that run's CLI stays unchanged.
+struct ImageLatentHandoff: Codable, Equatable {
+    var startAtStep: Int
+    var endAtStep: Int
+    var addNoise: Bool
+    var latentInPath: String
+    var writeLatent: Bool
+    var fullSteps: Int
+    var endedAtStep: Int
+    var seed: Int
+    var sampler: String
+    var scheduler: String
+    var flowShift: Double
+    var cfgScale: Double
+    var modelID: String
+    var textEncoder: String
+    var width: Int
+    var height: Int
+    var prompt: String
+    var negativePrompt: String
+}
+
 /// A prompt (with its own seed) waiting for the next free instance to render it.
 struct QueuedPrompt: Identifiable, Equatable {
     let id = UUID()
@@ -1476,6 +1537,8 @@ struct QueuedPrompt: Identifiable, Equatable {
     var targetInstanceID: UUID? = nil
     /// img2img source for this prompt only; nil = the instance's own init image.
     var initImagePath: String? = nil
+    /// Set for a draft or a draft Continue. Nil keeps the original full-schedule run.
+    var handoff: ImageLatentHandoff? = nil
 }
 
 /// A finished image kept in the session gallery, with the inputs that made it.
@@ -1491,6 +1554,16 @@ struct GeneratedImage: Identifiable {
     /// "index · model" of the instance that rendered it; nil if it was removed
     /// from the pool before this result was recorded.
     let instanceLabel: String?
+    /// Draft latent to resume. Nil for a normal image and for a finished Continue.
+    let latentURL: URL?
+    let fullSteps: Int?
+    let endedAtStep: Int?
+
+    var canContinue: Bool {
+        guard let latentURL, let fullSteps, let endedAtStep else { return false }
+        return endedAtStep > 0 && endedAtStep < fullSteps
+            && FileManager.default.fileExists(atPath: latentURL.path)
+    }
 }
 
 /// Owns the generation instances and one generator per slot; the sidebar
@@ -1501,6 +1574,8 @@ final class ImageGenPool: ObservableObject {
     @Published var configs: [ImageInstanceConfig] { didSet { save() } }
     /// Pending prompts; the scheduler feeds them to idle instances.
     @Published var queue: [QueuedPrompt] = []
+    /// Why the last Continue was refused, or empty. Codes: LATENT_MISSING, LATENT_MISMATCH.
+    @Published var continueNotice = ""
     /// While true, finished instances pull the next queued prompt automatically.
     @Published var queueActive = false
     /// Completed results this session (newest first), shown in the Queue feed.
@@ -1617,39 +1692,91 @@ final class ImageGenPool: ObservableObject {
     // MARK: prompt queue
 
     func enqueue(_ text: String, seed: Int = -1, steps: Int? = nil,
-                 targetInstanceID: UUID? = nil, initImagePath: String? = nil) {
+                 targetInstanceID: UUID? = nil, initImagePath: String? = nil,
+                 handoff: ImageLatentHandoff? = nil) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        let img = initImagePath?.isEmpty == false ? initImagePath : nil
+        let img = handoff == nil && initImagePath?.isEmpty == false ? initImagePath : nil
         queue.append(QueuedPrompt(text: t, seed: seed, steps: steps,
-                                  targetInstanceID: targetInstanceID, initImagePath: img))
+                                  targetInstanceID: targetInstanceID, initImagePath: img,
+                                  handoff: handoff))
         if queueActive { pump() }
     }
 
-    /// Comfy-style explore: N short drafts with fresh seeds on one instance.
+    /// Drafts sample 0…D of the full S-step schedule and keep the leftover latent.
     func enqueueDraftBatch(for c: ImageInstanceConfig) {
         let prompt = effectivePrompt(for: c)
         guard !prompt.isEmpty else { return }
-        let n = max(1, min(c.draftCount, 16))
+        continueNotice = ""
+        let model = c.resolvedModel(for: hardware)
+        guard model.sigmas.isEmpty else { return }
+        let full = model.steps(c.steps)
         let draft = max(1, c.draftSteps)
+        guard draft < full else { return }
+        let n = max(1, min(c.draftCount, 16))
+        let (w, h) = c.dimensions
+        let negative = effectiveNegativePrompt(for: c)
         for _ in 0..<n {
-            enqueue(prompt, seed: Int.random(in: 0..<Int(Int32.max)), steps: draft,
-                    targetInstanceID: c.id,
-                    initImagePath: c.initImagePath.isEmpty ? nil : c.initImagePath)
+            let seed = Int.random(in: 0..<Int(Int32.max))
+            let handoff = ImageLatentHandoff(
+                startAtStep: 0, endAtStep: draft, addNoise: true, latentInPath: "",
+                writeLatent: true, fullSteps: full, endedAtStep: draft, seed: seed,
+                sampler: c.samplingMethod, scheduler: c.scheduler, flowShift: c.flowShift,
+                cfgScale: c.effectiveCfg(for: model), modelID: model.name,
+                textEncoder: c.mossTextEncoder, width: w, height: h,
+                prompt: prompt, negativePrompt: negative)
+            enqueue(prompt, seed: seed, steps: full, targetInstanceID: c.id, handoff: handoff)
         }
         startQueue()
     }
 
-    /// Continue a draft (or any gallery hit) to the instance's full step count, same seed.
+    /// Resume a draft latent from D to S on the same schedule. Refuses anything else.
     func continueFull(from result: GeneratedImage, on c: ImageInstanceConfig) {
-        enqueue(result.prompt, seed: result.seed, steps: c.steps, targetInstanceID: c.id)
+        continueNotice = ""
+        guard let latentURL = result.latentURL, result.canContinue else {
+            continueNotice = "LATENT_MISSING"
+            return
+        }
+        let sidecar = URL(fileURLWithPath: latentURL.path + ".json")
+        guard let data = try? Data(contentsOf: sidecar),
+              let saved = try? JSONDecoder().decode(ImageLatentHandoff.self, from: data) else {
+            continueNotice = "LATENT_MISSING"
+            return
+        }
+        let model = c.resolvedModel(for: hardware)
+        let (w, h) = c.dimensions
+        let same = saved.fullSteps == model.steps(c.steps)
+            && c.samplingMethod == saved.sampler
+            && c.scheduler == saved.scheduler
+            && abs(c.flowShift - saved.flowShift) < 0.001
+            && abs(c.effectiveCfg(for: model) - saved.cfgScale) < 0.001
+            && model.name == saved.modelID
+            && c.mossTextEncoder == saved.textEncoder
+            && w == saved.width && h == saved.height
+            && result.prompt == saved.prompt
+            && result.seed == saved.seed
+            && effectiveNegativePrompt(for: c) == saved.negativePrompt
+        guard same else {
+            continueNotice = "LATENT_MISMATCH"
+            return
+        }
+        let handoff = ImageLatentHandoff(
+            startAtStep: saved.endedAtStep, endAtStep: saved.fullSteps, addNoise: false,
+            latentInPath: latentURL.path, writeLatent: false, fullSteps: saved.fullSteps,
+            endedAtStep: saved.fullSteps, seed: result.seed, sampler: saved.sampler,
+            scheduler: saved.scheduler, flowShift: saved.flowShift, cfgScale: saved.cfgScale,
+            modelID: saved.modelID, textEncoder: saved.textEncoder, width: w, height: h,
+            prompt: result.prompt, negativePrompt: saved.negativePrompt)
+        enqueue(result.prompt, seed: result.seed, steps: saved.fullSteps,
+                targetInstanceID: c.id, handoff: handoff)
         startQueue()
     }
 
     /// Shared sd-cli launch from an instance config (+ optional step/seed/init overrides).
     func launchGenerate(_ c: ImageInstanceConfig, models: ModelStore,
                         prompt: String, steps: Int, seed: Int,
-                        initImagePath: String? = nil) {
+                        initImagePath: String? = nil,
+                        handoff: ImageLatentHandoff? = nil) {
         let model = c.resolvedModel(for: hardware)
         let (w, h) = c.dimensions
         generator(for: c.id).generate(
@@ -1658,7 +1785,7 @@ final class ImageGenPool: ObservableObject {
             width: w, height: h, steps: steps, seed: seed, format: c.formatValue,
             offloadToCPU: c.offloadCPU, gpuIndex: c.gpuIndex,
             auxGPUIndex: c.auxGPU(gpuCount: hardware.gpus.count) ?? -1,
-            initImagePath: initImagePath ?? c.initImagePath, maskPath: c.maskPath,
+            initImagePath: handoff == nil ? (initImagePath ?? c.initImagePath) : "", maskPath: c.maskPath,
             strength: c.strength, referenceImagePaths: c.referenceImagePaths,
             fastMode: c.fastModeValue, previewMode: c.previewModeValue,
             cfgScale: c.effectiveCfg(for: model),
@@ -1667,7 +1794,8 @@ final class ImageGenPool: ObservableObject {
             slgScale: c.slgScale, slgStart: c.slgStart, slgEnd: c.slgEnd,
             slgLayers: c.slgLayers,
             controlNetPath: c.controlNetPath, controlImagePath: c.controlImagePath,
-            controlStrength: c.controlStrength, controlType: c.controlTypeValue)
+            controlStrength: c.controlStrength, controlType: c.controlTypeValue,
+            handoff: handoff)
     }
 
     func removeFromQueue(_ id: UUID) { queue.removeAll { $0.id == id } }
@@ -1679,9 +1807,12 @@ final class ImageGenPool: ObservableObject {
     /// so every render stays visible even as instances move on to the next prompt.
     private func recordResult(from gen: ImageGenerator, instanceID: UUID) {
         guard let url = gen.resultURL, let img = gen.resultImage, gallery.first?.url != url else { return }
+        let latent = gen.lastLatentURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
         gallery.insert(GeneratedImage(url: url, image: img, prompt: gen.lastPrompt, seed: gen.lastSeed,
                                       width: gen.lastWidth, height: gen.lastHeight, duration: gen.lastDuration,
-                                      instanceLabel: instanceLabel(for: instanceID)), at: 0)
+                                      instanceLabel: instanceLabel(for: instanceID),
+                                      latentURL: latent, fullSteps: gen.lastFullSteps,
+                                      endedAtStep: gen.lastEndedAtStep), at: 0)
         if gallery.count > 60 { gallery.removeLast() }
     }
 
@@ -1717,7 +1848,7 @@ final class ImageGenPool: ObservableObject {
             if let aux { busyGPUs.insert(aux) }
             launchGenerate(c, models: models, prompt: job.text,
                            steps: job.steps ?? c.steps, seed: job.seed,
-                           initImagePath: job.initImagePath)
+                           initImagePath: job.initImagePath, handoff: job.handoff)
         }
         if queue.isEmpty && !anyBusy { queueActive = false }
     }
