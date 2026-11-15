@@ -20,9 +20,10 @@ struct ImageServerSidebarRow: View {
             if reduceMotion { select() } else { withAnimation(.snappy(duration: 0.2), select) }
         } label: {
             HStack(spacing: 12) {
-                Image(systemName: server.isRunning ? "circle.fill" : "circle")
+                Image(systemName: server.isActive ? "circle.fill" : "circle")
                     .font(.system(size: 9))
-                    .foregroundStyle(server.isRunning ? .green : .secondary)
+                    .foregroundStyle(server.isRunning ? .green
+                                     : (server.isActive ? .orange : .secondary))
                 Text(loc.t("Servidor de imagen", "Image server"))
                     .lineLimit(1)
                 Spacer(minLength: 0)
@@ -46,15 +47,16 @@ struct ImageServerPane: View {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(spacing: 10) {
                     Circle()
-                        .fill(server.isRunning ? Color.green : Color.secondary)
+                        .fill(server.isRunning ? Color.green
+                              : (server.isActive ? Color.orange : Color.secondary))
                         .frame(width: 8, height: 8)
                     Text(statusText)
                         .font(.headline)
                     Spacer()
-                    Button(server.isRunning
+                    Button(server.isActive
                            ? loc.t("Detener", "Stop")
                            : loc.t("Iniciar", "Start")) {
-                        if server.isRunning { server.stop() } else { server.start() }
+                        if server.isActive { server.stop() } else { server.start() }
                     }
                     Button(loc.t("Abrir WebUI", "Open WebUI")) { server.openInBrowser() }
                         .disabled(ImageWebUIServer.bundledBinary() == nil)

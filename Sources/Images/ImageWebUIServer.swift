@@ -86,9 +86,27 @@ final class ImageWebUIServer: ObservableObject {
         return false
     }
 
+    /// Process is up or still coming up — Settings should offer Stop, not a dead Start.
+    var isActive: Bool {
+        switch state {
+        case .starting, .running: return true
+        default: return false
+        }
+    }
+
     var url: URL? {
         guard isRunning else { return nil }
         return URL(string: "http://127.0.0.1:\(port)/")
+    }
+
+    /// sd-server reports `empty` with no model loaded and `ready` once weights are in.
+    /// Both mean the HTTP listener is up; waiting only for `ready` leaves Settings stuck
+    /// on "Starting" forever for a background WebUI with no model yet.
+    nonisolated static func isListenReady(status: String) -> Bool {
+        switch status {
+        case "ready", "empty": return true
+        default: return false
+        }
     }
 
     static func bundledBinary() -> String? {
@@ -122,10 +140,25 @@ final class ImageWebUIServer: ObservableObject {
 
     /// Empty WebUI, until Generate starts the same process with a model loaded.
     func start() {
-        if isRunning || process?.isRunning == true { return }
+        if isRunning { return }
+        if case .starting = state { return }
+        // Orphan: process still alive after a failed readiness wait — reclaim it.
+        if process?.isRunning == true {
+            Task { await reclaimRunningProcess() }
+            return
+        }
         let port = UserDefaults.standard.object(forKey: SettingsKeys.imagenWebUIPort) as? Int ?? 1234
         let launch = Launch(contextArgs: [], env: ProcessInfo.processInfo.environment, port: max(1, min(port, 65535)))
-        Task { try? await ensure(launch) }
+        Task {
+            do {
+                try await ensure(launch)
+            } catch {
+                if case .starting = state {
+                    stopProcess()
+                    state = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                }
+            }
+        }
     }
 
     func beginJob() { jobsInFlight += 1 }
@@ -203,7 +236,15 @@ final class ImageWebUIServer: ObservableObject {
             throw error
         }
         launchKey = key
-        try await waitUntilReady(process: p)
+        do {
+            try await waitUntilReady(process: p)
+        } catch {
+            if process == p {
+                stopProcess()
+                state = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            }
+            throw error
+        }
         loadedSummary = launch.contextArgs.isEmpty
             ? ""
             : contextSummary(launch.contextArgs)
@@ -336,13 +377,29 @@ final class ImageWebUIServer: ObservableObject {
             if process != p || !p.isRunning {
                 throw ServerError.exited(String(logText.suffix(500)))
             }
-            if let status = try? await fetchStatus(), status == "ready" {
+            if let status = try? await fetchStatus(), Self.isListenReady(status: status) {
                 state = .running
                 return
             }
             try await Task.sleep(nanoseconds: 400_000_000)
         }
         throw ServerError.timeout
+    }
+
+    /// Attach UI state to an already-running process whose readiness wait never completed.
+    private func reclaimRunningProcess() async {
+        guard let p = process, p.isRunning else {
+            process = nil
+            state = .stopped
+            return
+        }
+        state = .starting
+        do {
+            try await waitUntilReady(process: p)
+        } catch {
+            stopProcess()
+            state = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
     }
 
     private func fetchStatus() async throws -> String {

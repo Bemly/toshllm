@@ -343,7 +343,7 @@ struct ImageControls: View {
                             TextField("1234", value: $imagenWebUIPort, format: .number.grouping(.never))
                                 .workspaceTextField().frame(width: 64)
                                 .onChange(of: imagenWebUIPort) { _, _ in
-                                    if imageWebUI.isRunning {
+                                    if imageWebUI.isActive {
                                         imageWebUI.stop()
                                         imageWebUI.start()
                                     }
