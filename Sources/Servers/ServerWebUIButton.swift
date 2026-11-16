@@ -13,6 +13,7 @@ struct ServerWebUIButton: View {
     @ObservedObject var server: ServerController
     var presentation: Presentation = .labeled
     @EnvironmentObject private var loc: Localizer
+    @EnvironmentObject private var control: ControlPanelState
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var imageWebUI = ImageWebUIServer.shared
 
@@ -22,9 +23,11 @@ struct ServerWebUIButton: View {
 
     var body: some View {
         Button {
-            openWindow(id: "webui", value: WebUITarget(
+            control.openWebUI(
                 llamaURL: server.webChatURL,
-                title: loc.t("WebUI", "WebUI")))
+                title: loc.t("WebUI", "WebUI"))
+            // Same main window as Chat / Images / … (bring it forward if needed).
+            openWindow(id: "chat")
         } label: {
             if presentation == .icon {
                 Image(systemName: "macwindow")
@@ -35,8 +38,8 @@ struct ServerWebUIButton: View {
         .disabled(!canOpen)
         .opacity(canOpen ? 1 : 0.48)
         .help(canOpen
-              ? loc.t("Abrir WebUI en ToshLLM (llama.cpp, KVMem, Strata, sd.cpp)",
-                      "Open WebUI inside ToshLLM (llama.cpp, KVMem, Strata, sd.cpp)")
+              ? loc.t("Ver WebUI en esta ventana (llama.cpp, KVMem, Strata, sd.cpp)",
+                      "View WebUI in this window (llama.cpp, KVMem, Strata, sd.cpp)")
               : loc.t("Inicia el servidor de texto o el WebUI de imágenes",
                       "Start the text server or the image WebUI"))
         .accessibilityLabel(loc.t("Abrir WebUI", "Open WebUI"))

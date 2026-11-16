@@ -6,7 +6,7 @@ import AppKit
 import SwiftUI
 import WebKit
 
-/// Value passed to `openWindow(id: "webui", value:)` so each llama server can own a window.
+/// Target for the main-window WebUI mode (llama / KVMem / Strata / sd.cpp).
 struct WebUITarget: Codable, Hashable {
     /// llama-server chat URL (may include lang/gpu/backend query).
     var llamaURL: URL

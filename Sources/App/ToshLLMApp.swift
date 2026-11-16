@@ -169,23 +169,13 @@ struct ToshLLMApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
 
-        // In-app WebUI (llama / KVMem / Strata / sd.cpp); WKWebView is created only while open.
-        WindowGroup(id: "webui", for: WebUITarget.self) { $target in
-            InAppWebUIView(target: target)
-                .environmentObject(loc)
-                .environmentObject(obj.manager)
-                .tint(AppTheme.accent(appAccentRaw))
-        } defaultValue: {
-            WebUITarget(llamaURL: URL(string: "http://127.0.0.1:8080/")!, title: "WebUI")
-        }
-        .defaultSize(width: 1100, height: 760)
-
         MenuBarExtra(isInserted: $menuBarIcon) {
             MenuBarView()
                 .environmentObject(obj.server)
                 .environmentObject(obj.manager)
                 .environmentObject(loc)
                 .environmentObject(obj.vram)
+                .environmentObject(obj.control)
         } label: {
             MenuBarLabel(server: obj.server, vram: obj.vram, loc: obj.loc)
         }

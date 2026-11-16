@@ -52,14 +52,22 @@ final class ControlPanelState: ObservableObject {
     @Published var pendingMainMode: MainMode?
     @Published var settingsSection: Section_ = .settings
     @Published var mainSettingsTicket = UUID()
+    /// Target for the in-window WebUI mode (llama / KVMem / Strata / sd.cpp).
+    @Published var webUITarget: WebUITarget?
+
+    func openWebUI(llamaURL: URL, title: String) {
+        webUITarget = WebUITarget(llamaURL: llamaURL, title: title)
+        pendingMainMode = .webui
+        mainSettingsTicket = UUID()
+    }
 }
 
 enum SettingsAnchor: Hashable {
     case chat
 }
 
-/// Top-level mode of the main window: chat, studios, or settings.
-enum MainMode: String { case chat, images, video, audio, settings }
+/// Top-level mode of the main window: chat, studios, settings, or embedded WebUI.
+enum MainMode: String { case chat, images, video, audio, settings, webui }
 
 struct ChatMainView: View {
     @EnvironmentObject var server: ServerController
@@ -75,6 +83,7 @@ struct ChatMainView: View {
     @AppStorage(SettingsKeys.onboardingDone) private var onboardingDone = false
     @State private var showOnboarding = false
     @State private var mode: MainMode = .chat
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @StateObject private var imageGenPool = ImageGenPool()
     @StateObject private var videoGenPool = VideoGenPool()
     @StateObject private var audioStudio = AudioStudioController.shared
@@ -85,7 +94,7 @@ struct ChatMainView: View {
     var body: some View {
         // A single NavigationSplitView for both modes: only the sidebar and detail
         // content swap, so the window chrome stays put and Chat/Images doesn't jump.
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             Group {
                 if mode == .images {
                     ImageControls(pool: imageGenPool, upscaler: upscaler).transition(.opacity)
@@ -98,6 +107,9 @@ struct ChatMainView: View {
                         withAnimation(.easeInOut(duration: 0.2)) { mode = .chat }
                     }
                     .transition(.opacity)
+                } else if mode == .webui {
+                    // Detail-only: WebUI fills the window like the other modes' canvases.
+                    Color.clear.frame(width: 0).transition(.opacity)
                 } else {
                     ConversationListView().transition(.opacity)
                 }
@@ -112,6 +124,9 @@ struct ChatMainView: View {
                     AudioCanvas(studio: audioStudio).transition(.opacity)
                 } else if mode == .settings {
                     ControlPanelDetail().transition(.opacity)
+                } else if mode == .webui, let target = control.webUITarget {
+                    InAppWebUIView(target: target)
+                        .transition(.opacity)
                 } else {
                     chatDetail.transition(.opacity)
                 }
@@ -119,6 +134,13 @@ struct ChatMainView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .animation(.easeInOut(duration: 0.2), value: mode)
+        .onChange(of: mode) { _, newMode in
+            columnVisibility = newMode == .webui ? .detailOnly : .all
+            // Leaving WebUI unmounts WKWebView (view removed) so WebKit can release memory.
+            if newMode != .webui {
+                // Keep webUITarget so re-opening the same server is instant; the view is gone.
+            }
+        }
         .tint(AppTheme.accent(accentRaw))
         .background {
             ZStack {
@@ -286,8 +308,7 @@ struct ChatMainView: View {
                             "ToshLLM %@ available... install it from Settings → Home.", version))
             }
             ServerWebUIButton(server: server, presentation: .icon)
-                .buttonStyle(GlassIconButtonStyle())
-                .disabled(mode != .chat)
+                .buttonStyle(GlassIconButtonStyle(active: mode == .webui))
             // No separate Configuration window: the gear in modePicker is Settings.
         }
     }
@@ -400,6 +421,8 @@ struct ChatMainView: View {
         case .video: loc.t("Vídeo · Experimental", "Video · Experimental")
         case .audio: loc.t("Audio · audio.cpp GPU", "Audio · audio.cpp GPU")
         case .settings: loc.t("Ajustes", "Settings")
+        case .webui: loc.t("WebUI · llama.cpp / KVMem / Strata / sd.cpp",
+                           "WebUI · llama.cpp / KVMem / Strata / sd.cpp")
         }
     }
 }
