@@ -104,10 +104,24 @@ final class ImageGalleryStoreTests: XCTestCase {
 
     func testMossTextEncoderCasesIncludeAnimusAndHeretic() {
         let labels = ImageMossTextEncoder.allCases.map(\.shortLabel)
-        XCTAssertEqual(labels, ["Q4", "Q8", "Animus", "Heretic"])
+        XCTAssertEqual(labels, ["Q8", "Animus", "Heretic"])
+        XCTAssertEqual(ImageMossTextEncoder.q8.component.fileName,
+                       "Qwen3.5-9B-Q8_0.gguf")
         XCTAssertEqual(ImageMossTextEncoder.animus.component.fileName,
                        "Qwen3.5-9B-Animus-V13.0-Q8_0.gguf")
-        XCTAssertTrue(ImageMossTextEncoder.heretic.component.fileName.contains("heretic"))
+        XCTAssertEqual(ImageMossTextEncoder.heretic.component.fileName,
+                       "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q8_0.gguf")
+        for encoder in ImageMossTextEncoder.allCases {
+            XCTAssertEqual(URL(string: encoder.component.urlString)?.lastPathComponent,
+                           encoder.component.fileName)
+        }
+    }
+
+    func testMossBaseF16SavedIDResolvesToQ8() {
+        XCTAssertTrue(ImageGenCatalog.isMossBase("MOSS-Image (F16)"))
+        XCTAssertEqual(ImageGenCatalog.model(id: "MOSS-Image (F16)")?.id,
+                       ImageGenCatalog.mossImageBaseQ8.id)
+        XCTAssertFalse(ImageGenCatalog.models.contains { $0.id == "MOSS-Image (F16)" })
     }
 
     func testCanonicalPathUnifiesVarPrivateSymlink() {

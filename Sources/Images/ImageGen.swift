@@ -454,19 +454,15 @@ enum ImageGenCatalog {
         urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
         fileName: "Qwen3.5-9B-Q8_0.gguf", sizeGB: 9.53)
 
-    static let mossLLMQ4 = ImageGenComponent(kind: .textEncoder,
-        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
-        fileName: "Qwen3.5-9B-Q4_K_M.gguf", sizeGB: 5.3)
-
-    /// Local fine-tune already under `vision/text_encoders/` (Animus V13 Q8).
+    /// Q8 fine-tune for MOSS `--llm`.
     static let mossLLMAnimus = ImageGenComponent(kind: .textEncoder,
-        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf",
+        urlString: "https://huggingface.co/Darkhn-Quants-3/Qwen3.5-9B-Animus-V13.0-GGUF/resolve/main/Qwen3.5-9B-Animus-V13.0-Q8_0.gguf",
         fileName: "Qwen3.5-9B-Animus-V13.0-Q8_0.gguf", sizeGB: 9.53)
 
-    /// Local uncensored Q6_K fine-tune under `vision/text_encoders/`.
+    /// Q8 uncensored fine-tune for MOSS `--llm`.
     static let mossLLMHeretic = ImageGenComponent(kind: .textEncoder,
-        urlString: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf",
-        fileName: "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q6_K.gguf", sizeGB: 7.1)
+        urlString: "https://huggingface.co/mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF/resolve/main/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q8_0.gguf",
+        fileName: "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q8_0.gguf", sizeGB: 9.8)
 
     /// MOSS-Image (5B DiT + FLUX.2 VAE + Qwen3.5-9B). Needs an external tokenizer.
     static func mossImage(_ name: String, detailES: String, detailEN: String,
@@ -495,16 +491,6 @@ enum ImageGenCatalog {
         repo: "leejet/MOSS-Image-Base-GGUF", file: "MOSS-Image-Base-Q8_0.gguf",
         sizeGB: 5.48, minVRAMGB: 10)
 
-    /// Full BF16 DiT (UI label F16). Heavier resident weights than Q8.
-    static let mossImageBaseF16 = mossImage(
-        "MOSS-Image (F16)",
-        detailES: "5B DiT BF16 + Qwen3.5-9B. Más fiel, más VRAM que Q8.",
-        detailEN: "5B DiT BF16 + Qwen3.5-9B. Closer to full precision; more VRAM than Q8.",
-        repo: "Comfy-Org/MOSS-Image",
-        file: "moss_image_base_bf16.safetensors",
-        sizeGB: 10.2, minVRAMGB: 14,
-        urlPath: "diffusion_models/moss_image_base_bf16.safetensors")
-
     static let mossImageSFTQ8 = mossImage(
         "MOSS-Image SFT",
         detailES: "5B SFT. Misma pila que Base, afinada para seguir el prompt.",
@@ -518,14 +504,12 @@ enum ImageGenCatalog {
     static let models: [ImageGenModel] = [sd15, zImageTurbo, sdxlTurbo, qwenImage21Q3, qwenImage21TurboQ3,
                                           flux2Klein4B, qwenImage21Q4, qwenImage21TurboQ4, flux2Klein9B,
                                           fluxSchnell, qwenImage21Q6, qwenImage21TurboQ6, qwenImage,
-                                          mossImageBaseQ8, mossImageBaseF16, mossImageSFTQ8,
+                                          mossImageBaseQ8, mossImageSFTQ8,
                                           qwenImage21Q8, qwenImage21TurboQ8, flux2Dev]
 
-    /// Base MOSS Q8 ↔ F16 pair for the DiT precision switch.
-    static let mossBasePrecisionIDs: [String] = [mossImageBaseQ8.id, mossImageBaseF16.id]
-
     static func isMossBase(_ modelID: String) -> Bool {
-        mossBasePrecisionIDs.contains(modelID) || modelID == "MOSS-Image"
+        modelID == mossImageBaseQ8.id || modelID == "MOSS-Image"
+            || modelID == "MOSS-Image (F16)"
     }
 
     /// Any MOSS catalog entry (Base or SFT) — shows the text-encoder picker.
@@ -543,8 +527,8 @@ enum ImageGenCatalog {
 
     static func model(id: String) -> ImageGenModel? {
         if let m = models.first(where: { $0.id == id }) { return m }
-        // Pre-rename id from when Base Q8 was just "MOSS-Image".
-        if id == "MOSS-Image" { return mossImageBaseQ8 }
+        // Keep old saved Base IDs resolving to Q8 after the precision choice was removed.
+        if id == "MOSS-Image" || id == "MOSS-Image (F16)" { return mossImageBaseQ8 }
         return nil
     }
 
@@ -757,7 +741,6 @@ enum ImagePreviewMode: String, CaseIterable, Identifiable {
 
 /// Qwen3.5-9B (and fine-tunes) for MOSS `--llm` (`vision/text_encoders/`).
 enum ImageMossTextEncoder: String, CaseIterable, Identifiable {
-    case q4 = "q4"
     case q8 = "q8"
     case animus = "animus"
     case heretic = "heretic"
@@ -765,7 +748,6 @@ enum ImageMossTextEncoder: String, CaseIterable, Identifiable {
 
     var component: ImageGenComponent {
         switch self {
-        case .q4: return ImageGenCatalog.mossLLMQ4
         case .q8: return ImageGenCatalog.mossLLMQ8
         case .animus: return ImageGenCatalog.mossLLMAnimus
         case .heretic: return ImageGenCatalog.mossLLMHeretic
@@ -774,7 +756,6 @@ enum ImageMossTextEncoder: String, CaseIterable, Identifiable {
 
     var shortLabel: String {
         switch self {
-        case .q4: return "Q4"
         case .q8: return "Q8"
         case .animus: return "Animus"
         case .heretic: return "Heretic"

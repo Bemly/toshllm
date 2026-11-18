@@ -1232,13 +1232,9 @@ struct ImageInstanceForm: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(loc.t("Modelo", "Model")).font(.caption).foregroundStyle(.secondary)
             Picker("", selection: modelFamilySelection) {
-                ForEach(ImageGenCatalog.models.filter {
-                    $0.id != ImageGenCatalog.mossImageBaseF16.id
-                }) { m in
+                ForEach(ImageGenCatalog.models) { m in
                     let label = m.id == ImageGenCatalog.mossImageBaseQ8.id ? "MOSS-Image" : m.name
                     let fits = m.fitsVRAMClass(targetVRAM)
-                        || (m.id == ImageGenCatalog.mossImageBaseQ8.id
-                            && ImageGenCatalog.mossImageBaseF16.fitsVRAMClass(targetVRAM))
                     Text(fits ? label : "\(label) · \(Int(m.minVRAMGB)) GB+").tag(m.id)
                 }
                 Divider()
@@ -1259,19 +1255,6 @@ struct ImageInstanceForm: View {
                 }
                 clampBaseSize()
             }
-            if ImageGenCatalog.isMossBase(cfg.modelID) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(loc.t("DiT", "DiT")).font(.caption2).foregroundStyle(.secondary)
-                    Picker("", selection: mossBasePrecision) {
-                        Text("Q8").tag(ImageGenCatalog.mossImageBaseQ8.id)
-                        Text("F16").tag(ImageGenCatalog.mossImageBaseF16.id)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .help(loc.t("Q8 es más ligero; F16 (BF16) es más fiel y pide más VRAM.",
-                                "Q8 is lighter; F16 (BF16) is closer to full precision and needs more VRAM."))
-                }
-            }
             if ImageGenCatalog.isMossFamily(cfg.modelID) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(loc.t("Codificador de texto", "Text encoder")).font(.caption2).foregroundStyle(.secondary)
@@ -1282,15 +1265,15 @@ struct ImageInstanceForm: View {
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
-                    .help(loc.t("Qwen3.5-9B en text_encoders/: Q4 / Q8 / Animus / Heretic.",
-                                "Qwen3.5-9B under text_encoders/: Q4 / Q8 / Animus / Heretic."))
+                    .help(loc.t("Qwen3.5-9B en text_encoders/: Q8 / Animus / Heretic.",
+                                "Qwen3.5-9B under text_encoders/: Q8 / Animus / Heretic."))
                 }
             }
             Text(model.detail(loc.isSpanish)).font(.caption2).foregroundStyle(.secondary)
         }
     }
 
-    /// Main picker collapses MOSS Base Q8/F16 onto one "MOSS-Image" row.
+    /// Main picker shows the MOSS Base Q8 model as "MOSS-Image".
     private var modelFamilySelection: Binding<String> {
         Binding(
             get: {
@@ -1307,16 +1290,6 @@ struct ImageInstanceForm: View {
                 }
                 applyModelSelection(next)
             })
-    }
-
-    private var mossBasePrecision: Binding<String> {
-        Binding(
-            get: {
-                cfg.modelID == ImageGenCatalog.mossImageBaseF16.id
-                    ? ImageGenCatalog.mossImageBaseF16.id
-                    : ImageGenCatalog.mossImageBaseQ8.id
-            },
-            set: { applyModelSelection($0) })
     }
 
     private func applyModelSelection(_ newID: String) {
