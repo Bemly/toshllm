@@ -339,6 +339,13 @@ enum ImageGalleryStore {
         if !out.hasUsableParams, let recovered = recordFromLatentSidecar(for: out.imageURL) {
             out = out.merging(better: recovered)
         }
+        if (out.fullSteps == nil || out.endedAtStep == nil),
+           let recovered = recordFromLatentSidecar(for: out.imageURL),
+           (out.fullSteps == nil || out.fullSteps == recovered.fullSteps),
+           (out.endedAtStep == nil || out.endedAtStep == recovered.endedAtStep) {
+            out.fullSteps = recovered.fullSteps
+            out.endedAtStep = recovered.endedAtStep
+        }
         if (out.width <= 0 || out.height <= 0),
            let (w, h) = pixelSize(of: out.imageURL) {
             out.width = w

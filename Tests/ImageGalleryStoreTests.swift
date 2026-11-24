@@ -81,6 +81,62 @@ final class ImageGalleryStoreTests: XCTestCase {
         XCTAssertEqual(cfg.aspect, ImageAspect.custom.rawValue)
     }
 
+    func testLegacyLatentMetadataWithoutTextEncoderCanBeRecovered() throws {
+        let image = try writeTinyJPEG(named: "toshllm_legacy_latent.jpg")
+        let latent = image.deletingPathExtension().appendingPathExtension("sdlt")
+        try Data().write(to: latent)
+        let handoff = ImageLatentHandoff(
+            startAtStep: 0, endAtStep: 8, addNoise: true, latentInPath: "",
+            writeLatent: true, fullSteps: 20, endedAtStep: 8, seed: 41,
+            sampler: "euler", scheduler: "simple", flowShift: 5, cfgScale: 3,
+            modelID: "MOSS-Image (Q8)", textEncoder: "q8",
+            width: 32, height: 48, prompt: "legacy sketch", negativePrompt: "")
+        let encoded = try JSONEncoder().encode(handoff)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "textEncoder")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        try legacyData.write(to: URL(fileURLWithPath: latent.path + ".json"))
+
+        let decoded = try JSONDecoder().decode(ImageLatentHandoff.self, from: legacyData)
+        XCTAssertEqual(decoded.textEncoder, "")
+        var incomplete = object
+        incomplete.removeValue(forKey: "seed")
+        let incompleteData = try JSONSerialization.data(withJSONObject: incomplete)
+        XCTAssertThrowsError(try JSONDecoder().decode(ImageLatentHandoff.self, from: incompleteData))
+        let recovered = try XCTUnwrap(ImageGalleryStore.recordFromLatentSidecar(for: image))
+        XCTAssertEqual(recovered.prompt, "legacy sketch")
+        XCTAssertEqual(recovered.mossTextEncoder, "")
+        XCTAssertEqual(recovered.latentPath, latent.path)
+    }
+
+    func testScanRestoresDraftStepsFromLatentSidecarForUsableRecord() throws {
+        let image = try writeTinyJPEG(named: "toshllm_recover_steps.jpg")
+        let latent = image.deletingPathExtension().appendingPathExtension("sdlt")
+        try Data().write(to: latent)
+        let handoff = ImageLatentHandoff(
+            startAtStep: 6, endAtStep: 20, addNoise: false, latentInPath: "",
+            writeLatent: true, fullSteps: 50, endedAtStep: 20, seed: 41,
+            sampler: "euler", scheduler: "simple", flowShift: 5, cfgScale: 3,
+            modelID: "MOSS-Image (Q8)", textEncoder: "heretic",
+            width: 32, height: 48, prompt: "sketch", negativePrompt: "")
+        try JSONEncoder().encode(handoff).write(to: URL(fileURLWithPath: latent.path + ".json"))
+        let partial = ImageGalleryRecord(imagePath: image.path, prompt: "sketch", seed: 41,
+                                         width: 32, height: 48, fullSteps: 50)
+        ImageGalleryStore.saveIndex([partial], in: dir)
+
+        let recovered = try XCTUnwrap(ImageGalleryStore.scan(imagenDirectory: dir).first)
+        XCTAssertEqual(recovered.fullSteps, 50)
+        XCTAssertEqual(recovered.endedAtStep, 20)
+        XCTAssertEqual(recovered.latentPath, latent.path)
+        XCTAssertTrue(try XCTUnwrap(GeneratedImage.from(record: recovered)).canContinue)
+
+        var conflicting = partial
+        conflicting.fullSteps = 40
+        let unchanged = ImageGalleryStore.enrich(conflicting)
+        XCTAssertEqual(unchanged.fullSteps, 40)
+        XCTAssertNil(unchanged.endedAtStep)
+    }
+
     func testScanFillsPixelSizeWhenNoMetadata() throws {
         let image = try writeTinyJPEG(named: "toshllm_pixels_only.jpg")
         let scanned = ImageGalleryStore.scan(imagenDirectory: dir)
@@ -140,6 +196,32 @@ final class ImageGalleryStoreTests: XCTestCase {
         XCTAssertGreaterThan(h, 0)
         XCTAssertNotEqual(generated.sizeLabel, "—")
         XCTAssertFalse(generated.sizeLabel.contains("0×0"))
+    }
+
+    @MainActor
+    func testDraftBatchQueuesIndividualSeeds() throws {
+        let pool = ImageGenPool()
+        var config = ImageInstanceConfig()
+        config.modelID = ImageGenCatalog.mossImageBaseQ8.id
+        config.prompt = "test sketch"
+        config.steps = 20
+        config.draftSteps = 8
+        config.draftCount = 4
+
+        pool.enqueueDraftBatch(for: config)
+
+        XCTAssertEqual(pool.queue.count, 4)
+        XCTAssertTrue(pool.queue.allSatisfy { $0.batchCount == 1 && $0.targetInstanceID == config.id })
+        let seeds = pool.queue.map(\.seed)
+        XCTAssertEqual(Set(seeds).count, 4)
+        let firstSeed = try XCTUnwrap(seeds.first)
+        XCTAssertEqual(seeds, Array(firstSeed..<(firstSeed + 4)))
+        for item in pool.queue {
+            let handoff = try XCTUnwrap(item.handoff)
+            XCTAssertEqual(handoff.seed, item.seed)
+            XCTAssertEqual(handoff.endedAtStep, 8)
+            XCTAssertEqual(handoff.fullSteps, 20)
+        }
     }
 
     private func writeTinyJPEG(named name: String) throws -> URL {

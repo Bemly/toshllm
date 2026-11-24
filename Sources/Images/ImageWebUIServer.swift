@@ -41,17 +41,30 @@ final class ImageWebUIServer: ObservableObject {
             var prompt: String
             var width: Int
             var height: Int
+            var clipSkip: Int?
+            var zeroOutMasked: Bool?
             var ageSeconds: Int
+        }
+        struct Lora {
+            var path: String
+            var strength: Double
         }
         var capacity: Int
         var size: Int
+        var storageScopeID: String
         var modelLoaded: Bool
+        var isSnapshot: Bool
+        var textEncoder: String
+        var diffusionModel: String
+        var tokenizer: String
+        var loras: [Lora]
         var entries: [Entry]
     }
 
     enum ServerError: LocalizedError {
         case missingBinary
         case busy
+        case cacheSnapshotUnavailable
         case exited(String)
         case timeout
         case http(Int, String)
@@ -60,6 +73,7 @@ final class ImageWebUIServer: ObservableObject {
             switch self {
             case .missingBinary: return "MISSING_SD_SERVER"
             case .busy: return "IMAGE_SERVER_BUSY"
+            case .cacheSnapshotUnavailable: return "CACHE_SNAPSHOT_UNAVAILABLE"
             case .exited(let tail): return tail.isEmpty ? "EXIT" : tail
             case .timeout: return "TIMEOUT"
             case .http(_, let body): return body
@@ -75,8 +89,8 @@ final class ImageWebUIServer: ObservableObject {
     private var process: Process?
     private var stderrPipe: Pipe?
     private var launchKey = ""
-    private var jobsInFlight = 0
-    /// Lines the image log should see (cache hits live on the server's stderr).
+    @Published private(set) var jobsInFlight = 0
+    /// Lines the image log should see.
     var onLog: ((String) -> Void)?
 
     private init() {}
@@ -185,6 +199,10 @@ final class ImageWebUIServer: ObservableObject {
         if !launch.contextArgs.contains("--auto-fit") {
             args += ["--auto-fit", "off"]
         }
+        if !launch.contextArgs.contains("--conditioning-cache-dir") {
+            args += ["--conditioning-cache-dir",
+                     AppSupport.directory.appendingPathComponent("imagen-conditioning-cache", isDirectory: true).path]
+        }
         args += launch.contextArgs
         if !args.contains("--release-te-after-encode") && !args.contains("--keep-te") {
             args.append("--keep-te")
@@ -198,7 +216,7 @@ final class ImageWebUIServer: ObservableObject {
         p.arguments = args
         p.environment = launch.env
         let err = Pipe()
-        p.standardOutput = FileHandle.nullDevice
+        p.standardOutput = err
         p.standardError = err
         stderrPipe = err
         err.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -291,12 +309,20 @@ final class ImageWebUIServer: ObservableObject {
             error: message)
     }
 
-    func cancelJob(_ id: String) async {
-        _ = try? await request(path: "/sdcpp/v1/jobs/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+    func cancelJob(_ id: String) async throws {
+        let (payload, code) = try await request(path: "/sdcpp/v1/jobs/\(id)/cancel", method: "POST", body: Data("{}".utf8))
+        guard code == 200 else {
+            throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
+        }
     }
 
     func fetchConditioningCache() async throws -> ConditioningCacheSnapshot {
         let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache", method: "GET", body: nil)
+        if code == 503,
+           let json = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
+           json["code"] as? String == "cache_snapshot_unavailable" {
+            throw ServerError.cacheSnapshotUnavailable
+        }
         guard code == 200,
               let json = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any] else {
             throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
@@ -315,12 +341,24 @@ final class ImageWebUIServer: ObservableObject {
                          prompt: row["prompt"] as? String ?? "",
                          width: intField(row["width"]),
                          height: intField(row["height"]),
+                         clipSkip: (row["clip_skip"] as? NSNumber)?.intValue,
+                         zeroOutMasked: row["zero_out_masked"] as? Bool,
                          ageSeconds: intField(row["age_seconds"]))
+        }
+        let loras = (json["loras"] as? [[String: Any]] ?? []).compactMap { row -> ConditioningCacheSnapshot.Lora? in
+            guard let path = row["path"] as? String, let strength = row["strength"] as? NSNumber else { return nil }
+            return .init(path: path, strength: strength.doubleValue)
         }
         return ConditioningCacheSnapshot(
             capacity: intField(json["capacity"]),
             size: intField(json["size"]),
+            storageScopeID: json["storage_scope_id"] as? String ?? "",
             modelLoaded: (json["model_loaded"] as? Bool) ?? true,
+            isSnapshot: (json["snapshot"] as? Bool) ?? false,
+            textEncoder: json["text_encoder"] as? String ?? "",
+            diffusionModel: json["diffusion_model"] as? String ?? "",
+            tokenizer: json["tokenizer"] as? String ?? "",
+            loras: loras,
             entries: entries)
     }
 
@@ -335,6 +373,25 @@ final class ImageWebUIServer: ObservableObject {
         let encoded = id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? id
         let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache?id=\(encoded)",
                                                 method: "DELETE", body: nil)
+        guard code == 200 else {
+            throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
+        }
+    }
+
+    func deleteDiskConditioningCache(scope: String? = nil, id: String? = nil) async throws {
+        let query: String
+        if let scope, let id {
+            guard scope.utf8.count == 16, id.utf8.count == 16,
+                  (scope + id).utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+                throw ServerError.http(400, "Invalid cache scope or entry id")
+            }
+            query = "scope=\(scope)&id=\(id)"
+        } else if scope == nil && id == nil {
+            query = "all=true"
+        } else {
+            throw ServerError.http(400, "Invalid cache scope or entry id")
+        }
+        let (payload, code) = try await request(path: "/sdcpp/v1/conditioning-cache/disk?\(query)", method: "DELETE", body: nil)
         guard code == 200 else {
             throw ServerError.http(code, String(data: payload, encoding: .utf8) ?? "HTTP \(code)")
         }

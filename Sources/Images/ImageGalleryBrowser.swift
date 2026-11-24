@@ -50,6 +50,9 @@ struct ImageGalleryBrowser: View {
                 selectedID = ordered.first?.id
             }
         }
+        .onChange(of: selectedID) {
+            pool.continueNotice = ""
+        }
     }
 
     private var toolbar: some View {
@@ -127,6 +130,9 @@ struct ImageGalleryBrowser: View {
                 if let model = record.modelID.nilIfEmpty {
                     Text(model).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
+                if item.canContinue, let ended = item.endedAtStep, let full = item.fullSteps {
+                    Text("\(ended)/\(full)").font(.caption.monospaced()).foregroundStyle(.secondary)
+                }
                 Spacer()
             }
             if let prompt {
@@ -138,6 +144,11 @@ struct ImageGalleryBrowser: View {
                 Text(loc.t("Sin parámetros recuperables", "No recoverable parameters"))
                     .font(.caption)
                     .foregroundStyle(.tertiary)
+            }
+            if !pool.continueNotice.isEmpty {
+                Text(imageFailureText(pool.continueNotice, loc))
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
         }
         .padding(.horizontal, 12)
@@ -152,6 +163,18 @@ struct ImageGalleryBrowser: View {
                 ?? ImageGalleryRecord(imagePath: item.url.path))
         return HStack(spacing: 10) {
             Spacer(minLength: 8)
+            if item.canContinue {
+                Button {
+                    if let config = pool.configs.first {
+                        pool.continueFull(from: item, on: config)
+                    }
+                } label: {
+                    Label(loc.t("Continuar", "Continue"), systemImage: "forward.end")
+                }
+                .disabled(pool.configs.isEmpty)
+                .help(loc.t("Continúa el borrador hasta los pasos de borrador actuales de la instancia.",
+                            "Resume the draft to the instance's current draft steps."))
+            }
             if record.hasUsableParams || record.width > 0 {
                 Button {
                     pool.importRecord(record)

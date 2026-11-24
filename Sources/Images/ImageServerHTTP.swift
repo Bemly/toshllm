@@ -11,7 +11,7 @@ enum ImageServerHTTP {
         "--llm", "--llm_vision", "--llm-vision", "--t5xxl", "--clip_l", "--clip-l",
         "--tokenizer", "--lora-model-dir", "--backend", "--params-backend", "--control-net",
         "--taesd", "--high-noise-diffusion-model", "--clip-vision", "--photo-maker",
-        "--model-dir", "--auto-fit", "--conditioning-cache-size",
+        "--model-dir", "--auto-fit", "--conditioning-cache-size", "--conditioning-cache-dir",
     ]
     static let contextBoolFlags: Set<String> = [
         "--release-te-after-encode", "--keep-te", "--offload-to-cpu", "--diffusion-fa",

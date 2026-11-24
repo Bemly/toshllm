@@ -324,8 +324,8 @@ struct ImageControls: View {
                     }
                     .toggleStyle(.switch)
                     .controlSize(.mini)
-                    .help(loc.t("Al salir de la app borra las imágenes generadas (toshllm_*) de la carpeta de salida, para no acumular cientos con los nombres por fecha.",
-                                "On quitting the app, deletes the generated images (toshllm_*) from the output folder, so the date-named files don't pile up."))
+                    .help(loc.t("Al salir de la app borra los archivos generados (toshllm_*), incluidos los latentes .sdlt y sus metadatos JSON; esos borradores ya no se podrán reanudar ni recuperar en la galería.",
+                                "On quitting the app, deletes generated files (toshllm_*), including .sdlt latents and JSON metadata; those drafts can no longer be resumed or restored in the gallery."))
 
                     Toggle(isOn: $imagenWebUI) {
                         Text(loc.t("sd.cpp WebUI en segundo plano", "sd.cpp WebUI in background"))
@@ -721,6 +721,8 @@ struct QueueFeedView: View {
                 }
                 .glassButton(prominent: true)
                 .disabled(!pool.queueActive && pool.queue.isEmpty)
+                .help(loc.t("Detiene los trabajos de la cola en curso y conserva los pendientes.",
+                            "Stops active queue jobs and keeps pending jobs."))
             }
         }
         .frame(minHeight: 32)
@@ -801,6 +803,13 @@ struct QueueFeedView: View {
                     if let instanceLabel { instanceBadge(instanceLabel) }
                 }
                 HStack(spacing: 8) {
+                    if gen.cancelRequested {
+                        Text(loc.t("Deteniendo…", "Stopping…")).foregroundStyle(.secondary)
+                    } else if !gen.cancelError.isEmpty {
+                        Text(loc.t("Error al detener: %@", "Stop failed: %@", gen.cancelError))
+                            .foregroundStyle(.red)
+                        Button(loc.t("Reintentar", "Retry")) { gen.cancel() }
+                    }
                     if gen.lastSeed >= 0 {
                         Text("#\(gen.lastSeed)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
                     }
@@ -1047,8 +1056,8 @@ private struct ImageDraftControlExtras: View {
             .controlSize(.small)
             .disabled(busy || pool.effectivePrompt(for: cfg).isEmpty || !installed
                       || !model.sigmas.isEmpty || cfg.draftSteps >= model.steps(cfg.steps))
-            .help(loc.t("Una sola corrida: el TE se codifica una vez y MOSS muestrea cada semilla. Vista previa limpia; latente ruidoso para Continuar. No usa la imagen inicial.",
-                        "One run: TE encodes once, then MOSS samples each seed. Clean preview; noisy latent for Continue. The init image is not used."))
+            .help(loc.t("Cada semilla se guarda al terminar; el servidor reutiliza la codificación del prompt. Vista previa limpia; latente ruidoso para Continuar. No usa la imagen inicial.",
+                        "Each seed is saved as it finishes; the warm server reuses the prompt encoding. Clean preview; noisy latent for Continue. The init image is not used."))
         }
         .padding(.top, 4)
     }
@@ -1890,8 +1899,11 @@ struct ImageInstanceForm: View {
 }
 
 /// Turn the engine's failure sentinel into a bilingual, actionable message.
-private func imageFailureText(_ raw: String, _ loc: Localizer) -> String {
+func imageFailureText(_ raw: String, _ loc: Localizer) -> String {
     switch raw {
+    case "INVALID_MOSS_TEXT_ENCODING":
+        return loc.t("El codificador de texto MOSS devolvió valores inválidos; la generación se detuvo y no se guardó esa caché.",
+                     "The MOSS text encoder returned invalid values; generation stopped and the result was not cached.")
     case "OOM":
         return loc.t("No hay VRAM suficiente para ese tamaño. Usa un formato no cuadrado o un tamaño menor.",
                      "Not enough VRAM for that size. Use a non-square ratio or a smaller size.")
@@ -1905,8 +1917,8 @@ private func imageFailureText(_ raw: String, _ loc: Localizer) -> String {
         return loc.t("Falta el latente del borrador, así que esta imagen no puede continuar.",
                      "The draft latent is missing, so this image cannot be continued.")
     case "LATENT_MISMATCH":
-        return loc.t("Continuar exige el mismo modelo, tamaño, pasos, muestreador, planificador, CFG, shift y prompts del borrador.",
-                     "Continue needs the same model, size, steps, sampler, scheduler, CFG, shift and prompts as the draft.")
+        return loc.t("Importa los parámetros del borrador a la instancia. Continuar exige el mismo modelo, codificador de texto, tamaño, pasos, muestreador, planificador, CFG, shift y prompts.",
+                     "Import the draft's parameters into the instance. Continue needs the same model, text encoder, size, steps, sampler, scheduler, CFG, shift and prompts.")
     case "LATENT_STEP":
         return loc.t("Sube Pasos borrador por encima del paso actual del borrador (o hasta el total para acabarlo).",
                      "Raise Draft steps above the sketch's current step (or to the full count to finish it).")

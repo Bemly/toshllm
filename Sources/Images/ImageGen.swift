@@ -870,6 +870,8 @@ final class ImageGenerator: ObservableObject {
 
     @Published var state: State = .idle
     @Published var stage: Stage = .loading
+    @Published var cancelRequested = false
+    @Published var cancelError = ""
     /// 0...1 across the sampling steps, parsed from the engine's progress line.
     @Published var progress: Double = 0
     @Published var stepText: String = ""
@@ -982,13 +984,10 @@ final class ImageGenerator: ObservableObject {
     }
 
     func cancel() {
+        guard isBusy, !cancelRequested else { return }
         process?.terminate()
-        process = nil
-        runTask?.cancel()
-        if let id = activeJobID {
-            Task { await ImageWebUIServer.shared.cancelJob(id) }
-        }
-        if isBusy { state = .idle }
+        cancelError = ""
+        cancelRequested = true
     }
 
     /// sd-cli --backend spec for the encoder/VAE split: diffusion on Metal slot 0,
@@ -1038,6 +1037,9 @@ final class ImageGenerator: ObservableObject {
                   handoff: ImageLatentHandoff? = nil,
                   batchCount: Int = 1) {
         guard !isBusy else { return }
+        cancelRequested = false
+        cancelError = ""
+        logTail = ""
         let steps = model.steps(steps)
         let cfg = cfgScale ?? model.cfgScale
         // A reference that went missing would shift every <imageN> after it, so the run
@@ -1385,6 +1387,7 @@ final class ImageGenerator: ObservableObject {
             cleanupPendingLatents()
             // 15/SIGTERM and 2/SIGINT are user cancels, not errors.
             if status == 15 || status == 2 { state = .failed(""); return }
+            if logTail.contains("INVALID_MOSS_TEXT_ENCODING") { state = .failed("INVALID_MOSS_TEXT_ENCODING"); return }
             if logTail.contains("failed to allocate") { state = .failed("OOM"); return }
             let timedOut = logTail.contains("Timeout") || logTail.contains("status 5")
             state = .failed(timedOut ? "TIMEOUT" : "exit \(status)")
@@ -1621,6 +1624,36 @@ struct ImageLatentHandoff: Codable, Equatable {
     var negativePrompt: String
 }
 
+extension ImageLatentHandoff {
+    private enum CodingKeys: String, CodingKey {
+        case startAtStep, endAtStep, addNoise, latentInPath, writeLatent, fullSteps
+        case endedAtStep, seed, sampler, scheduler, flowShift, cfgScale, modelID
+        case textEncoder, width, height, prompt, negativePrompt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        startAtStep = try c.decode(Int.self, forKey: .startAtStep)
+        endAtStep = try c.decode(Int.self, forKey: .endAtStep)
+        addNoise = try c.decode(Bool.self, forKey: .addNoise)
+        latentInPath = try c.decode(String.self, forKey: .latentInPath)
+        writeLatent = try c.decode(Bool.self, forKey: .writeLatent)
+        fullSteps = try c.decode(Int.self, forKey: .fullSteps)
+        endedAtStep = try c.decode(Int.self, forKey: .endedAtStep)
+        seed = try c.decode(Int.self, forKey: .seed)
+        sampler = try c.decode(String.self, forKey: .sampler)
+        scheduler = try c.decode(String.self, forKey: .scheduler)
+        flowShift = try c.decode(Double.self, forKey: .flowShift)
+        cfgScale = try c.decode(Double.self, forKey: .cfgScale)
+        modelID = try c.decode(String.self, forKey: .modelID)
+        textEncoder = try c.decodeIfPresent(String.self, forKey: .textEncoder) ?? ""
+        width = try c.decode(Int.self, forKey: .width)
+        height = try c.decode(Int.self, forKey: .height)
+        prompt = try c.decode(String.self, forKey: .prompt)
+        negativePrompt = try c.decode(String.self, forKey: .negativePrompt)
+    }
+}
+
 /// A prompt (with its own seed) waiting for the next free instance to render it.
 struct QueuedPrompt: Identifiable, Equatable {
     let id = UUID()
@@ -1735,6 +1768,7 @@ final class ImageGenPool: ObservableObject {
     weak var modelStore: ModelStore?
     private var generators: [UUID: ImageGenerator] = [:]
     private var forwards: [UUID: AnyCancellable] = [:]
+    private var queuedInstances: Set<UUID> = []
 
     init() {
         if let data = UserDefaults.standard.data(forKey: SettingsKeys.imagenInstances),
@@ -1816,6 +1850,7 @@ final class ImageGenPool: ObservableObject {
         let g = ImageGenerator()
         g.onFinish = { [weak self, weak g] in
             guard let self, let g else { return }
+            self.queuedInstances.remove(id)
             self.recordResult(from: g, instanceID: id)
             self.pump()
         }
@@ -1891,7 +1926,8 @@ final class ImageGenPool: ObservableObject {
         if queueActive { pump() }
     }
 
-    /// One sd-cli run: TE encodes once, then MOSS samples N seeds on 0…D of S.
+    /// Queue each seed separately so every completed sketch is saved immediately.
+    /// The warm server's conditioning cache reuses the prompt encoding between runs.
     func enqueueDraftBatch(for c: ImageInstanceConfig) {
         let prompt = effectivePrompt(for: c)
         guard !prompt.isEmpty else { return }
@@ -1906,15 +1942,18 @@ final class ImageGenPool: ObservableObject {
         let negative = effectiveNegativePrompt(for: c)
         // Leave room so seed+i stays inside Int32 for the engine.
         let seed = Int.random(in: 0..<(Int(Int32.max) - n))
-        let handoff = ImageLatentHandoff(
-            startAtStep: 0, endAtStep: draft, addNoise: true, latentInPath: "",
-            writeLatent: true, fullSteps: full, endedAtStep: draft, seed: seed,
-            sampler: c.samplingMethod, scheduler: c.scheduler, flowShift: c.flowShift,
-            cfgScale: c.effectiveCfg(for: model), modelID: model.name,
-            textEncoder: c.mossTextEncoder, width: w, height: h,
-            prompt: prompt, negativePrompt: negative)
-        enqueue(prompt, seed: seed, steps: full, targetInstanceID: c.id,
-                handoff: handoff, batchCount: n)
+        for offset in 0..<n {
+            let itemSeed = seed + offset
+            let handoff = ImageLatentHandoff(
+                startAtStep: 0, endAtStep: draft, addNoise: true, latentInPath: "",
+                writeLatent: true, fullSteps: full, endedAtStep: draft, seed: itemSeed,
+                sampler: c.samplingMethod, scheduler: c.scheduler, flowShift: c.flowShift,
+                cfgScale: c.effectiveCfg(for: model), modelID: model.name,
+                textEncoder: c.mossTextEncoder, width: w, height: h,
+                prompt: prompt, negativePrompt: negative)
+            enqueue(prompt, seed: itemSeed, steps: full, targetInstanceID: c.id,
+                    handoff: handoff)
+        }
         startQueue()
     }
 
@@ -1941,7 +1980,7 @@ final class ImageGenPool: ObservableObject {
             && abs(c.flowShift - saved.flowShift) < 0.001
             && abs(c.effectiveCfg(for: model) - saved.cfgScale) < 0.001
             && model.name == saved.modelID
-            && c.mossTextEncoder == saved.textEncoder
+            && (saved.textEncoder.isEmpty || c.mossTextEncoder == saved.textEncoder)
             && w == saved.width && h == saved.height
             && result.prompt == saved.prompt
             && result.seed == saved.seed
@@ -1965,7 +2004,7 @@ final class ImageGenPool: ObservableObject {
             latentInPath: latentURL.path, writeLatent: keepSketch, fullSteps: full,
             endedAtStep: nextEnd, seed: result.seed, sampler: saved.sampler,
             scheduler: saved.scheduler, flowShift: saved.flowShift, cfgScale: saved.cfgScale,
-            modelID: saved.modelID, textEncoder: saved.textEncoder, width: w, height: h,
+            modelID: saved.modelID, textEncoder: c.mossTextEncoder, width: w, height: h,
             prompt: result.prompt, negativePrompt: saved.negativePrompt)
         enqueue(result.prompt, seed: result.seed, steps: full,
                 targetInstanceID: c.id, handoff: handoff)
@@ -2002,7 +2041,10 @@ final class ImageGenPool: ObservableObject {
     func removeFromQueue(_ id: UUID) { queue.removeAll { $0.id == id } }
 
     func startQueue() { queueActive = true; pump() }
-    func stopQueue() { queueActive = false }   // in-flight runs finish; nothing new starts
+    func stopQueue() {
+        queueActive = false
+        for id in queuedInstances { generators[id]?.cancel() }
+    }
 
     /// Append a generator's finished result to the session gallery (newest first),
     /// so every render stays visible even as instances move on to the next prompt.
@@ -2102,6 +2144,7 @@ final class ImageGenPool: ObservableObject {
             let job = queue.remove(at: idx)
             busyGPUs.insert(c.gpuIndex)
             if let aux { busyGPUs.insert(aux) }
+            queuedInstances.insert(c.id)
             launchGenerate(c, models: models, prompt: job.text,
                            steps: job.steps ?? c.steps, seed: job.seed,
                            initImagePath: job.initImagePath, handoff: job.handoff,

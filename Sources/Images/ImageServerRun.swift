@@ -13,48 +13,65 @@ extension ImageGenerator {
         server.onLog = { [weak self] text in
             Task { @MainActor in self?.noteServerLog(text, steps: steps) }
         }
-        defer {
+        var jobBegan = false
+        func cleanupRun() {
+            if jobBegan { server.endJob() }
             server.onLog = nil
             activeJobID = nil
             runTask = nil
+            cancelRequested = false
         }
         do {
             try await server.ensure(.init(contextArgs: split.context, env: env, port: port))
             server.beginJob()
-            defer { server.endJob() }
-            if Task.isCancelled { finish(status: 15, output: output); return }
+            jobBegan = true
+            if cancelRequested {
+                cleanupRun()
+                finish(status: 15, output: output)
+                return
+            }
             let body = try ImageServerHTTP.requestBody(from: split.values, bools: split.bools, output: output)
             let id = try await server.submit(body)
             activeJobID = id
             fileLog.append("POST /sdcpp/v1/img_gen \(id)\n")
             var lastPreview = ""
-            while !Task.isCancelled {
+            var cancellationSent = false
+            while true {
+                if cancelRequested && !cancellationSent {
+                    do {
+                        try await server.cancelJob(id)
+                        cancellationSent = true
+                    } catch {
+                        cancelError = error.localizedDescription
+                        fileLog.append("Cancellation failed: \(error.localizedDescription)\n")
+                        cancelRequested = false
+                    }
+                }
                 let job = try await server.poll(id)
                 apply(job, steps: steps, lastPreview: &lastPreview)
                 switch job.status {
                 case "completed":
                     try writeImages(job.imagesB64, output: output)
+                    cleanupRun()
                     finish(status: 0, output: output)
                     return
                 case "failed":
                     logTail += job.error ?? "failed"
+                    cleanupRun()
                     finish(status: 1, output: output)
                     return
                 case "cancelled":
+                    cleanupRun()
                     finish(status: 15, output: output)
                     return
                 default:
                     try await Task.sleep(nanoseconds: 350_000_000)
                 }
             }
-            await server.cancelJob(id)
-            finish(status: 15, output: output)
-        } catch is CancellationError {
-            if let id = activeJobID { await server.cancelJob(id) }
-            finish(status: 15, output: output)
         } catch {
             logTail += error.localizedDescription
             fileLog.append(error.localizedDescription + "\n")
+            cleanupRun()
             state = .failed(error.localizedDescription)
             onFinish?()
         }

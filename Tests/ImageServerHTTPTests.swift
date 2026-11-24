@@ -83,6 +83,19 @@ final class ImageServerHTTPTests: XCTestCase {
         XCTAssertEqual(base, again)
     }
 
+    func testConditioningCacheDirectoryStaysOnServerContext() {
+        let split = ImageServerHTTP.partition([
+            "--conditioning-cache-size", "16",
+            "--conditioning-cache-dir", "/tmp/conditioning-cache",
+            "-p", "a cat",
+        ])
+        XCTAssertEqual(split.context, [
+            "--conditioning-cache-size", "16",
+            "--conditioning-cache-dir", "/tmp/conditioning-cache",
+        ])
+        XCTAssertNil(split.values["--conditioning-cache-dir"])
+    }
+
     @MainActor func testExtraUIMountArgsPreferBundledTrees() {
         // Empty when not running inside the app bundle; still exercises the API shape.
         let args = ServerSettings.extraUIMountArgs
