@@ -10,6 +10,30 @@
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.88.0] - 2026-11-18
+
+### Added
+
+- **Models can download from a mirror such as hf-mirror.com (#156).** Settings › General › Download source picks Hugging Face, hf-mirror.com or an address of your own, and downloads, search and update checks all go there; the SHA-256 checksum is still verified. HF_ENDPOINT is honored when the app is opened with it.
+
+### Improved
+
+- **LLMs: the engine moves to llama.cpp v1.0.0.** Upstream's fixes and model support since v0.6.0 come with it, and the AMD backend, Dynamic MoE and the rest of the engine work carry over.
+- **LLMs: a model's name comes from its Hugging Face repo, with who published the file next to it (#164).** Placeholders such as "Hf" no longer win, and the server card can reveal the file in Finder. Contributed by [andruwa13](https://github.com/andruwa13) in [#165](https://github.com/engeldlgado/toshllm/pull/165).
+- **The Mac no longer idle-sleeps in the middle of a generation (#163).** While an answer, an image, a video, an upscale, a transcription, a subtitled export or a benchmark runs, ToshLLM keeps the system awake; the display can still turn off.
+
+### Fixed
+
+- **LLMs: Qwen3.5 and Qwen3.8 Flash-Next files from newer converters load instead of failing with "tensor not found".**
+- **LLMs: GGUFs with FP8 weights load instead of being read as another type;** their matrix products run on the CPU.
+- **LLMs on AMD cards: MoE models that choose experts by groups with softmax routing pick the right ones.**
+- **LLMs: Gemma 4 tool calls that start before the model closes its thinking are read as calls.**
+- **LLMs: a client that keeps its connection open after a streamed answer can send its next request on it.**
+- **LLMs on Radeon RX 400/500, Vega, Radeon VII and Radeon Pro Vega/WX: models with BF16 weights, such as Gemma 4 E4B, no longer stop the engine on prompts of 448 tokens or more.** Reported by [andruwa13](https://github.com/andruwa13) in [#149](https://github.com/engeldlgado/toshllm/pull/149).
+- **LLMs on Radeon RX 6000 cards: Gemma 4 26B describes the image it is shown instead of a jumble of coloured text (#166).** The step that lays the image features out on a grid before pooling scattered them; it has done so since 0.87.32.
+- **LLMs: the agent's text search reads past its first 100 matches (#167).** It takes an offset and says which one gives the next page, so a model no longer gets the same 100 lines back each time. Proposed by [Sergey](https://github.com/SergeySlice) in [#167](https://github.com/engeldlgado/toshllm/issues/167).
+- **Chat: Maximum image size under Attachments lines up with the rows around it,** with its icon and its ⓘ where the others have them.
+
 ## [0.87.34] - 2026-11-11
 
 ### Improved

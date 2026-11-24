@@ -165,6 +165,7 @@ struct ChatMainView: View {
         }
         .navigationTitle("")
         .toolbar {
+            #if compiler(>=6.2)
             if #available(macOS 26.0, *) {
                 ToolbarItem(placement: .navigation) { toolbarIdentity }
                     .sharedBackgroundVisibility(.hidden)
@@ -177,6 +178,11 @@ struct ChatMainView: View {
                 ToolbarItem(placement: .principal) { modePicker }
                 toolbarActions
             }
+            #else
+            ToolbarItem(placement: .navigation) { toolbarIdentity }
+            ToolbarItem(placement: .principal) { modePicker }
+            toolbarActions
+            #endif
         }
         .hiddenChatToolbarBackground()
         .onAppear {

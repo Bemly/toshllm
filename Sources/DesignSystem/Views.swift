@@ -85,6 +85,19 @@ struct ControlPanelDetail: View {
                 .scrollContentBackground(.hidden)
         }
         .background(WorkspaceStyle.canvas)
+        .toolbar {
+            #if compiler(>=6.2)
+            if #available(macOS 26, *) {
+                ToolbarSpacer(.flexible)
+                ToolbarItem(placement: .automatic) { DonateToolbarButton() }
+                    .sharedBackgroundVisibility(.hidden)
+            } else {
+                ToolbarItem(placement: .automatic) { DonateToolbarButton() }
+            }
+            #else
+            ToolbarItem(placement: .automatic) { DonateToolbarButton() }
+            #endif
+        }
     }
 
     private var selectedServer: ServerController? {
